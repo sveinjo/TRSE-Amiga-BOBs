@@ -92,6 +92,16 @@ program bobs;
 */
 
 var
+	@export "resources/images/nagel.flf"	 "resources/images/nagel.bin" 256
+
+   	//i,j,k, isDone: integer = 0;
+	// Re-exported from nagel.flf at 3 bitplanes/8 colors specifically to
+	// match #screen's own NUM_PLANES=3 layout -- image is now 30720 bytes
+	// (40 bytes/plane-row * 3 planes * 256 rows), byte-for-byte the same
+	// size and row-interleaved layout as #screen (ROW_STRIDE*256, see
+	// NUM_PLANES/ROW_STRIDE's own comments below). See DrawBackgroundImage.
+   	image : incbin("resources/images/nagel.bin") chipmem;
+	image_palette : incbin("resources/images/nagel.pal");
 	// ------------------------------------------------------------------
 	// Screen / palette
 	// ------------------------------------------------------------------
@@ -177,6 +187,40 @@ var
 
 	const ROW_STRIDE:integer = 40*DISPLAY_BITPLANES;   // bytes per screen row, ALL planes (real + padding) together
 	screen : array[ROW_STRIDE*256] of byte chipmem;
+
+	// ------------------------------------------------------------------
+	// Double buffering -- see FlipBuffer/RestoreEntitiesDB/
+	// SaveBufferPositions's own comments for the full mechanism. screen2
+	// is a second, identical-layout buffer; each frame draws into
+	// whichever of screen/screen2 is currently NOT being displayed
+	// (cur_buf/draw_target), then FlipBuffer() re-points the copper's own
+	// bitplane pointers at it -- a handful of register pokes (the exact
+	// SetCopperList32 poke SetupDefaultScreen itself already does, see
+	// FlipBuffer's own comment), not a screen-sized copy. This is what
+	// removes the old single-buffer raster deadline entirely: nothing is
+	// ever drawn into the buffer currently being scanned out, so there is
+	// no beam to race.
+	// ------------------------------------------------------------------
+	screen2 : array[ROW_STRIDE*256] of byte chipmem;
+	// Which buffer (0=screen, 1=screen2) THIS frame draws into -- i.e. the
+	// current BACK buffer. Starts at 1: Main's own
+	// SetupDefaultScreen(#screen, DISPLAY_BITPLANES) call already makes
+	// screen(0) the initial FRONT buffer, so the first frame's back buffer
+	// is screen2. Deliberately "integer", not "byte", despite only ever
+	// holding 0/1: it's used as an array index (buf_px[cur_buf], etc.) and
+	// in a multiplication (cur_buf*16) -- no existing code in this file
+	// indexes or multiplies with a byte-typed variable, so there's no
+	// proven-safe precedent to lean on for whether a byte gets correctly
+	// zero-extended in either context (see gotcha #14's byte/integer
+	// zero-extension history). Staying "integer" avoids the question.
+	cur_buf : integer = 1;
+	// #screen or #screen2, mirroring cur_buf -- read by BlitStampMasked/
+	// BlitStampMaskedPerPlane/RestoreFromPristine/RestoreFromPristinePerPlane
+	// instead of a hardcoded #screen, so the same draw/restore code works
+	// against whichever buffer is currently the back one. Set to match
+	// cur_buf's own initial value in Main, and kept in sync by FlipBuffer
+	// every frame after.
+	draw_target : pointer of byte;
 
 	// LIVE KNOB, picks which entity blit technique DrawEnemies/DrawPlayer/
 	// RestoreEntities use -- see BlitStampMaskedPerPlane/
@@ -461,10 +505,49 @@ var
 	// Alternating start direction, matching we_dir's own convention below.
 	e_dir         : array[16] of byte = (1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0);
 	e_chasing     : array[16] of byte = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
+	// Patrol-only enemies ignore the player entirely and never chase --
+	// see UpdateEnemies' own e_patrol_only branch. Alternating so
+	// patrol-only and chase-capable enemies are mixed rather than
+	// clustered by index (same spirit as e_dir's own alternating start).
+	e_patrol_only : array[16] of byte = (1,1,1,1,1,1,1,1,0,1,0,1,0,1,0,1);
 	e_attacking   : array[16] of byte = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
 	e_hit_flag    : array[16] of byte = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
 	e_attack_timer    : array[16] of integer = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
 	e_attack_cooldown : array[16] of integer = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
+
+	// ------------------------------------------------------------------
+	// Double buffering: per-buffer draw-position HISTORY (see screen2's own
+	// declaration comment for the mechanism). Because each buffer is only
+	// redrawn every OTHER frame, RestoreEntitiesDB must erase at the
+	// positions THIS buffer was last drawn with -- two frames ago, not
+	// one -- so it can't just reuse the live px/py/ex/ey/atk_* globals
+	// (which only ever hold THIS frame's positions once Update* has run).
+	// Enemy arrays are 32 slots = 16 per buffer, indexed by cur_buf*16+i
+	// (see RestoreEntitiesDB/SaveBufferPositions) rather than declaring
+	// separate buf0_/buf1_ arrays, to avoid doubling the number of enemy-
+	// array names to keep in sync with NUM_ENEMIES/16-slot changes. All
+	// start at 0/inactive: both buffers begin as identical pure background
+	// with nothing drawn on either yet (see CopyScreenToScreen2), so there
+	// is nothing to erase on either buffer's first use.
+	// ------------------------------------------------------------------
+	buf_ex          : array[32] of integer = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
+	buf_ey          : array[32] of integer = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
+	buf_e_alive     : array[32] of byte    = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
+	buf_px          : array[2] of integer = (0,0);
+	buf_py          : array[2] of integer = (0,0);
+	buf_jump_height : array[2] of integer = (0,0);
+	buf_atk_active  : array[2] of byte = (0,0);
+	buf_atk_x       : array[2] of integer = (0,0);
+	buf_atk_y       : array[2] of integer = (0,0);
+	// Scratch, shared across RestoreEntitiesDB/SaveBufferPositions the same
+	// way "i" is already shared across every other enemy-array loop in
+	// this file -- see gotcha #1 (TRSE variables are effectively global,
+	// not procedure-scoped) for why that's the established convention here
+	// rather than a bug. bidx precomputed as its own plain variable before
+	// indexing (buf_off+i), rather than writing "buf_ex[buf_off+i]"
+	// inline, matching this file's general discipline of never trusting an
+	// un-precomputed compound expression somewhere new and untested.
+	buf_off, bidx : integer;
 
 
 	// ------------------------------------------------------------------
@@ -898,6 +981,59 @@ begin
 	end;
 end;
 
+// Copies the pre-rendered `image` buffer straight into #screen, once, in
+// place of DrawBackground()'s procedural fill. Safe as a flat per-plane
+// blitter copy (not a per-pixel reshuffle) ONLY because `image` was
+// re-exported at NUM_PLANES(3) bitplanes/8 colors specifically to match
+// #screen's own row-interleaved layout byte-for-byte -- see `image`'s own
+// declaration comment. DrawBackground() itself is left in place, unused,
+// as a fallback/reference.
+//
+// Per-plane loop, same pattern as CaptureBgPristine, for the same reason:
+// a single whole-buffer BLTSIZE call would need a width of ROW_STRIDE/2
+// words, which overflows BLTSIZE's 6-bit width field once ROW_STRIDE
+// exceeds 126 bytes -- safe today (60 words) but not worth relying on.
+//
+// Modulo asymmetry, worth getting right: the SOURCE (image) modulo is
+// 40*(NUM_PLANES-1), NOT ROW_STRIDE-40 -- image is tightly packed with
+// exactly NUM_PLANES chunks per row and carries no padding planes, so its
+// own row width is always 40*NUM_PLANES regardless of DISPLAY_BITPLANES.
+// The DEST (#screen) modulo IS ROW_STRIDE-40, since #screen's rows are
+// DISPLAY_BITPLANES chunks wide. The two coincide today only because
+// DISPLAY_BITPLANES=NUM_PLANES=3. The loop itself only walks NUM_PLANES
+// chunks (not DISPLAY_BITPLANES) since that's all `image` has real data
+// for; if DISPLAY_BITPLANES is ever raised above NUM_PLANES, the extra
+// planes need explicit zeroing (same reasoning as FastFillBand's own
+// padding-plane handling) -- not done here since it's untestable and
+// unreachable with the current, matching values.
+procedure DrawBackgroundImage();
+var dbicppl, dbicpsmod, dbicdmod, dbicpsize : integer; dbicpsrc, dbicpdst : pointer of byte;
+begin
+	dbicpsmod := 40*(NUM_PLANES-1);
+	dbicdmod := ROW_STRIDE - 40;
+	dbicpsize := (256<<6) | 20;   // 20 words = 40 bytes = one plane's row width
+	for dbicppl:=0 to NUM_PLANES do begin
+		dbicpsrc := #image + 40*dbicppl;
+		dbicpdst := #screen + 40*dbicppl;
+		asm("
+			lea $dff000,a6
+			move.l dbicpsrc,a0
+			move.l dbicpdst,a1
+		DrawBackgroundImageWait:
+			btst #14,$dff002
+			bne.s DrawBackgroundImageWait
+			move.l #$ffffffff,BLTAFWM(a6)
+			move.w #$09f0,BLTCON0(a6)
+			move.w #$0,BLTCON1(a6)
+			move.w dbicpsmod,BLTAMOD(a6)
+			move.w dbicdmod,BLTDMOD(a6)
+			move.l a0,BLTAPTH(a6)
+			move.l a1,BLTDPTH(a6)
+			move.w dbicpsize,BLTSIZE(a6)
+		");
+	end;
+end;
+
 
 // ========================================================================
 // Blitter-based entity drawing, save and restore (plain overwrite, no
@@ -1204,7 +1340,7 @@ end;
 // writeup) doesn't have anywhere to hide in this design: there is no
 // narrow/wide shortcut branch left to skip by mistake.
 procedure BlitStampMasked(mdst_bx, mdst_by, mwwords, mwhgt, mdshift : integer; wmask, mwspr : pointer of byte);
-var mcdmod, msize, mcon0, mcon1, mbeffw : integer;
+var mcdmod, msize, mcon0, mcon1, mbeffw, mdstoff : integer;
 var masrc, mbsrc, mcdst, mddst : pointer of byte;
 begin
 	mbeffw := mwwords+1;
@@ -1228,7 +1364,43 @@ begin
 	// variable last, matches the proven-safe 3-term shape used
 	// everywhere else in this file (e.g. SetPixel's
 	// "#screen + PLANE_SIZE*N + rowoff").
-	mcdst := #screen + mdst_by*ROW_STRIDE + mdst_bx;
+	// draw_target (#screen or #screen2, see its own declaration comment)
+	// instead of a hardcoded #screen, so this same procedure works against
+	// whichever buffer is currently the back one under double buffering.
+	//
+	// GOTCHA #15 (new, found while debugging double buffering -- CLAUDE.md):
+	// "draw_target + mdst_by*ROW_STRIDE + mdst_bx" LOOKS like the exact
+	// proven-safe 3-term/one-multiplication shape gotcha #8 established --
+	// but it silently truncates anyway, and the ONLY difference from the
+	// proven-safe "#screen + mdst_by*ROW_STRIDE + mdst_bx" is that the base
+	// is now a VARIABLE instead of a "#symbol" immediate. Confirmed via
+	// main.asm (comparing this build against the pre-double-buffering one
+	// in git history): the #screen version compiles the final combine as
+	// "add.l d1,d0"; the draw_target version compiles the IDENTICAL-shaped
+	// final combine as "add.w d1,d0" -- a 16-bit add that discards the
+	// pointer's upper word, the exact silent-corruption signature gotcha #8
+	// already trained us to recognize. This is what made every entity
+	// invisible: mcdst ended up as a small garbage address instead of a
+	// real chip RAM pointer. Root cause not fully understood (why a loaded
+	// variable base vs. an immediate base changes the chosen instruction
+	// width is not derivable from the visible codegen alone), but the
+	// trigger condition is confirmed and reproducible: a pointer VARIABLE
+	// (not a "#symbol") as the base of a multi-term pointer expression.
+	// Worth reporting upstream alongside gotcha #8.
+	//
+	// FIX: precompute the offset as a plain (non-pointer) integer -- safe,
+	// since it never touches the buggy pointer-base code path at all --
+	// then hand-roll the final pointer add in asm with an explicit add.l,
+	// bypassing TRSE's pointer-expression codegen for this one step
+	// entirely rather than trying to find another "shape" to trust.
+	mdstoff := mdst_by*ROW_STRIDE + mdst_bx;
+	asm("
+		move.l draw_target,d0
+		moveq #0,d1
+		move.w mdstoff,d1
+		add.l d1,d0
+		move.l d0,mcdst
+	");
 	mddst := mcdst;
 	asm("
 		lea $dff000,a6
@@ -1289,7 +1461,7 @@ end;
 // the build outright ("Variable 'mdst_bx' is already defined!"), not just
 // a style choice.
 procedure BlitStampMaskedPerPlane(ppdst_bx, ppdst_by, ppwwords, ppwhgt, ppdshift : integer; ppwmask, ppwspr : pointer of byte);
-var ppabmod, ppcdmod, ppsize, pprowoff, ppcon0, ppcon1, ppbeffw, ppchunk, pprowbytes, ppl : integer;
+var ppabmod, ppcdmod, ppsize, pprowoff, ppcon0, ppcon1, ppbeffw, ppchunk, pprowbytes, ppl, ppdstoff : integer;
 var ppasrc, ppbsrc, ppcdst, ppddst : pointer of byte;
 begin
 	ppbeffw := ppwwords+1;
@@ -1317,7 +1489,19 @@ begin
 		// "#screen + 40*cppl").
 		ppasrc := ppwmask + ppl*ppchunk;
 		ppbsrc := ppwspr + ppl*ppchunk;
-		ppcdst := #screen + ppl*40 + pprowoff;
+		// draw_target instead of hardcoded #screen, and the gotcha #15
+		// hand-rolled-asm workaround for it -- see BlitStampMasked's own
+		// comment for the full story (a pointer VARIABLE base, unlike a
+		// "#symbol" one, makes TRSE emit a truncating add.w for this exact
+		// 3-term shape, even though it's otherwise the proven-safe one).
+		ppdstoff := ppl*40 + pprowoff;
+		asm("
+			move.l draw_target,d0
+			moveq #0,d1
+			move.w ppdstoff,d1
+			add.l d1,d0
+			move.l d0,ppcdst
+		");
 		ppddst := ppcdst;
 		asm("
 			lea $dff000,a6
@@ -1370,7 +1554,7 @@ end;
 // a loop bound, but the parameter's job (how many plane-chunks per real
 // row) means exactly the same thing either way.
 procedure RestoreFromPristine(dst_bx, dst_by, wwords, whgt, nplanes : integer);
-var prmod, prsize : integer; prsrc, prdst : pointer of byte;
+var prmod, prsize, prdstoff : integer; prsrc, prdst : pointer of byte;
 begin
 	prmod := 40 - wwords*2;
 	prsize := ((whgt*nplanes)<<6) | wwords;
@@ -1382,9 +1566,22 @@ begin
 	// floor colors) to silently truncate a chipmem base address to 16
 	// bits. Keeping the multiply and the plain variable as separate
 	// terms, plain variable last, matches every proven-safe pointer
-	// expression elsewhere in this file.
+	// expression elsewhere in this file. #bg_pristine is a "#symbol", so
+	// this one is unaffected by gotcha #15 below.
 	prsrc := #bg_pristine + dst_by*ROW_STRIDE + dst_bx;
-	prdst := #screen + dst_by*ROW_STRIDE + dst_bx;
+	// draw_target instead of hardcoded #screen, and the gotcha #15
+	// hand-rolled-asm workaround for it -- see BlitStampMasked's own
+	// comment for the full story (a pointer VARIABLE base, unlike a
+	// "#symbol" one, makes TRSE emit a truncating add.w for this exact
+	// 3-term shape, even though it's otherwise the proven-safe one).
+	prdstoff := dst_by*ROW_STRIDE + dst_bx;
+	asm("
+		move.l draw_target,d0
+		moveq #0,d1
+		move.w prdstoff,d1
+		add.l d1,d0
+		move.l d0,prdst
+	");
 	asm("
 		lea $dff000,a6
 		move.l prsrc,a0
@@ -1416,14 +1613,26 @@ end;
 // comment: TRSE doesn't scope parameter names per procedure, so reusing
 // those exact names here fails the build the same way theirs did.
 procedure RestoreFromPristinePerPlane(rppdst_bx, rppdst_by, rppwwords, rppwhgt : integer);
-var rppmod, rppsize, rprowoff, rppl : integer; rppsrc, rppdst : pointer of byte;
+var rppmod, rppsize, rprowoff, rppl, rppdstoff : integer; rppsrc, rppdst : pointer of byte;
 begin
 	rppmod := ROW_STRIDE - rppwwords*2;
 	rppsize := (rppwhgt<<6) | rppwwords;
 	rprowoff := rppdst_by*ROW_STRIDE + rppdst_bx;
 	for rppl:=0 to NUM_PLANES do begin
 		rppsrc := #bg_pristine + rppl*40 + rprowoff;
-		rppdst := #screen + rppl*40 + rprowoff;
+		// draw_target instead of hardcoded #screen, and the gotcha #15
+		// hand-rolled-asm workaround for it -- see BlitStampMasked's own
+		// comment for the full story (a pointer VARIABLE base, unlike a
+		// "#symbol" one, makes TRSE emit a truncating add.w for this exact
+		// 3-term shape, even though it's otherwise the proven-safe one).
+		rppdstoff := rppl*40 + rprowoff;
+		asm("
+			move.l draw_target,d0
+			moveq #0,d1
+			move.w rppdstoff,d1
+			add.l d1,d0
+			move.l d0,rppdst
+		");
 		asm("
 			lea $dff000,a6
 			move.l rppsrc,a0
@@ -1492,6 +1701,88 @@ begin
 			move.l a1,BLTDPTH(a6)
 			move.w cpsize,BLTSIZE(a6)
 		");
+	end;
+end;
+
+// One-time startup copy of #screen (already holding the picture, painted
+// by DrawBackgroundImage) into #screen2, so BOTH buffers start out
+// identical before any entity is ever drawn on either -- see screen2's own
+// declaration comment for the double-buffering mechanism this feeds. Same
+// per-plane blitter pattern as CaptureBgPristine just above (a single
+// whole-buffer BLTSIZE call would overflow its 6-bit width field once
+// ROW_STRIDE grows past 126 bytes -- see that procedure's own comment),
+// just with #screen as the source instead of bg_pristine.
+procedure CopyScreenToScreen2();
+var cs2pl, cs2mod, cs2size : integer; cs2src, cs2dst : pointer of byte;
+begin
+	cs2mod := ROW_STRIDE - 40;
+	cs2size := (256<<6) | 20;
+	for cs2pl:=0 to DISPLAY_BITPLANES do begin
+		cs2src := #screen + 40*cs2pl;
+		cs2dst := #screen2 + 40*cs2pl;
+		asm("
+			lea $dff000,a6
+			move.l cs2src,a0
+			move.l cs2dst,a1
+		CopyScreenToScreen2Wait:
+			btst #14,$dff002
+			bne.s CopyScreenToScreen2Wait
+			move.l #$ffffffff,BLTAFWM(a6)
+			move.w #$09f0,BLTCON0(a6)
+			move.w #$0,BLTCON1(a6)
+			move.w cs2mod,BLTAMOD(a6)
+			move.w cs2mod,BLTDMOD(a6)
+			move.l a0,BLTAPTH(a6)
+			move.l a1,BLTDPTH(a6)
+			move.w cs2size,BLTSIZE(a6)
+		");
+	end;
+end;
+
+// Makes cur_buf's buffer (the one this frame just finished drawing into)
+// the new FRONT/displayed buffer, then flips cur_buf/draw_target so the
+// NEXT frame draws into the buffer that is now safely off-screen again.
+//
+// The BBUSY wait first is deliberate, not decorative -- same reasoning as
+// BlitterNastyOff's own wait: DrawEnemies TRIGGERS its last blit and
+// returns immediately, so the last blit into this buffer may still be
+// running. Waiting here guarantees the buffer is fully, consistently
+// drawn before it can become visible.
+//
+// The flip itself is just calling Graphics::SetupDefaultScreen again --
+// see graphics.tru: it does nothing but poke16(copper_resolution,...) and
+// a few SetCopperList32 calls, which themselves just write two 16-bit
+// words into the ALREADY-EXISTING static copper list's copper_bitplaneN
+// slots (confirmed against this project's own compiled main.asm -- see
+// CLAUDE.md's "double buffering" notes). It is a handful of register
+// pokes, not a data-moving operation, so calling it again here every
+// frame costs nothing like a screen-sized blit would -- this is exactly
+// the insight that made double buffering worth doing in the first place
+// (see CLAUDE.md: testing with a full-screen blit substituted for
+// RestoreEntities measured the cost of an operation double buffering
+// never needs to perform).
+//
+// The copper only re-executes copper_bitplaneN once per real vertical
+// blank (COP1LC reloads the copper's program counter at every vblank, so
+// it always restarts from the top of the list), so this poke's effect is
+// only ever visible starting the NEXT vblank -- by which point the blit
+// this procedure just waited for has long since finished, so there is
+// nothing for the beam to tear.
+procedure FlipBuffer();
+begin
+	asm("
+		FlipBufferWait:
+		btst #14,$dff002
+		bne.s FlipBufferWait
+	");
+	if (cur_buf=0) then begin
+		Graphics::SetupDefaultScreen(#screen, DISPLAY_BITPLANES);
+		cur_buf := 1;
+		draw_target := #screen2;
+	end else begin
+		Graphics::SetupDefaultScreen(#screen2, DISPLAY_BITPLANES);
+		cur_buf := 0;
+		draw_target := #screen;
 	end;
 end;
 
@@ -1826,8 +2117,16 @@ begin
 	for i:=0 to NUM_ENEMIES do begin
 		if (e_alive[i]=1) then begin
 
-			if (px>=ex[i]) then dist:=px-ex[i] else dist:=ex[i]-px;
-			if (dist<=DETECTION_RANGE) then e_chasing[i]:=1 else e_chasing[i]:=0;
+			// Patrol-only enemies (e_patrol_only[i]=1) skip detection
+			// entirely and stay permanently un-chasing, so they always
+			// fall through to the plain back-and-forth patrol branch
+			// below regardless of player distance.
+			if (e_patrol_only[i]=1) then begin
+				e_chasing[i]:=0;
+			end else begin
+				if (px>=ex[i]) then dist:=px-ex[i] else dist:=ex[i]-px;
+				if (dist<=DETECTION_RANGE) then e_chasing[i]:=1 else e_chasing[i]:=0;
+			end;
 
 			if (e_chasing[i]=1) then begin
 				if (px>=ex[i]) then e_facing[i]:=1 else e_facing[i]:=0;
@@ -1962,6 +2261,15 @@ begin
 	end;
 end;
 
+// UNUSED, kept as a single-buffer fallback/reference -- RestoreEntitiesDB
+// below is what the main loop actually calls now. Note this procedure
+// (and DrawPlayer/DrawEnemies, which it shares BlitStampMasked/
+// RestoreFromPristine with) now implicitly targets draw_target, not a
+// hardcoded #screen -- see draw_target's own declaration comment. If
+// double buffering is ever reverted, draw_target needs to be pinned to
+// #screen once in setup (and FlipBuffer's own calls removed from the main
+// loop) for this procedure to behave the way it used to.
+//
 // Restores every currently-alive-or-active moving entity's background at
 // its last-drawn position -- now pulled straight from the permanent
 // bg_pristine copy (RestoreFromPristine) instead of a per-frame snapshot,
@@ -2030,6 +2338,68 @@ begin
 	end;
 end;
 
+// Double-buffered counterpart to RestoreEntities() just above -- reads
+// position HISTORY (buf_ex/buf_ey/buf_e_alive/buf_px/etc, indexed by
+// cur_buf, see their own declaration comment) instead of the live
+// px/py/ex/ey/atk_* globals. Necessary because under double buffering
+// each screen buffer is only redrawn every OTHER frame: the buffer we're
+// about to draw into now was last drawn TWO frames ago, not one, so the
+// live globals (which only ever hold THIS frame's positions once Update*
+// has run) are the wrong thing to erase against. RestoreEntities() itself
+// is left declared, unused, as a single-buffer fallback/reference.
+procedure RestoreEntitiesDB();
+begin
+	buf_off := cur_buf*16;
+	for i:=0 to NUM_ENEMIES do begin
+		bidx := buf_off+i;
+		if (buf_e_alive[bidx]=1) then begin
+			// Same clamp-margin/ClampWordCol/ENTITY_BLIT_MODE reasoning as
+			// RestoreEntities() above -- only the position SOURCE differs.
+			ClampWordCol(buf_ex[bidx]-ENEMY_BOX_LEFT, (ENEMY_SPR_WORDS+1)*2);
+			if (ENTITY_BLIT_MODE=1) then
+				RestoreFromPristinePerPlane(blk_result, buf_ey[bidx]-64, ENEMY_SPR_WORDS+1, ENEMY_SPR_H)
+			else
+				RestoreFromPristine(blk_result, buf_ey[bidx]-64, ENEMY_SPR_WORDS+1, ENEMY_SPR_H, DISPLAY_BITPLANES);
+		end;
+	end;
+
+	ClampWordCol(buf_px[cur_buf]-PLAYER_BOX_LEFT, (PLAYER_SPR_WORDS+1)*2);
+	if (ENTITY_BLIT_MODE=1) then
+		RestoreFromPristinePerPlane(blk_result, buf_py[cur_buf]-buf_jump_height[cur_buf]-64, PLAYER_SPR_WORDS+1, PLAYER_SPR_H)
+	else
+		RestoreFromPristine(blk_result, buf_py[cur_buf]-buf_jump_height[cur_buf]-64, PLAYER_SPR_WORDS+1, PLAYER_SPR_H, DISPLAY_BITPLANES);
+
+	if (buf_atk_active[cur_buf]=1) then begin
+		ClampWordCol(buf_atk_x[cur_buf]-ATTACK_BOX_LEFT, (ATTACK_SPR_WORDS+1)*2);
+		if (ENTITY_BLIT_MODE=1) then
+			RestoreFromPristinePerPlane(blk_result, buf_atk_y[cur_buf]-10, ATTACK_SPR_WORDS+1, ATTACK_SPR_H)
+		else
+			RestoreFromPristine(blk_result, buf_atk_y[cur_buf]-10, ATTACK_SPR_WORDS+1, ATTACK_SPR_H, DISPLAY_BITPLANES);
+	end;
+end;
+
+// Commits THIS frame's just-drawn positions into cur_buf's own history, for
+// RestoreEntitiesDB to erase against the NEXT time this same buffer
+// becomes the back buffer again (two frames from now). Must run AFTER
+// DrawPlayer/DrawEnemies (needs the positions that were actually just
+// blitted) and BEFORE FlipBuffer swaps cur_buf over to the other buffer.
+procedure SaveBufferPositions();
+begin
+	buf_off := cur_buf*16;
+	for i:=0 to NUM_ENEMIES do begin
+		bidx := buf_off+i;
+		buf_ex[bidx] := ex[i];
+		buf_ey[bidx] := ey[i];
+		buf_e_alive[bidx] := e_alive[i];
+	end;
+	buf_px[cur_buf] := px;
+	buf_py[cur_buf] := py;
+	buf_jump_height[cur_buf] := jump_height;
+	buf_atk_active[cur_buf] := atk_active;
+	buf_atk_x[cur_buf] := atk_x;
+	buf_atk_y[cur_buf] := atk_y;
+end;
+
 
 // ========================================================================
 // Main
@@ -2079,7 +2449,20 @@ begin
 	// clobbering the first word of copper_bitplane0 (the pointer
 	// SetupNonInterlacedScreen had just set for bitplane 0). 31 gives
 	// exactly 32 writes, covering all 32 palette entries correctly.
-	setpalette(#palette,#copper_palette,31);
+	//
+	// Loading image_palette (8 entries, re-exported alongside `image` --
+	// see its own declaration comment) instead of the old hand-built
+	// `palette` array, now that the background comes from `image` via
+	// DrawBackgroundImage(): the background's pixel color indices are only
+	// meaningful against the palette they were exported with. Same
+	// off-by-one applies -- 7, not 8. `palette` itself is left declared,
+	// unused, alongside DrawBackground(). Entity colors (player=5,
+	// enemy=7, attack=6) are unaffected by which array is loaded here --
+	// they're just indices into whatever's active -- but will now render
+	// as whatever RGB values image_palette happens to have at those slots,
+	// which may not be as distinct from the picture as the old palette's
+	// deliberately-chosen entity colors were.
+	setpalette(#image_palette,#copper_palette,7);
 
 	// DIAGNOSTIC: copper-driven reference mark at raster line 44 -- the
 	// DIWSTRT value SetupNonInterlacedScreen's copper list uses (confirmed
@@ -2137,13 +2520,27 @@ begin
 	end;
 
 
-	DrawBackground();
+	// DrawBackground() (procedural fill) is kept declared, unused, as a
+	// fallback/reference -- see its own and DrawBackgroundImage()'s comments.
+	DrawBackgroundImage();
 
+	// Double buffering: prime screen2 with the SAME picture, so both
+	// buffers start out identical before any entity is ever drawn on
+	// either -- see screen2's own declaration comment. draw_target is set
+	// to match cur_buf's own initial value (1 = screen2, see cur_buf's
+	// declaration comment) so the very first frame's RestoreEntitiesDB/
+	// DrawPlayer/DrawEnemies calls, before the loop's own FlipBuffer ever
+	// runs, still target the correct buffer.
+	CopyScreenToScreen2();
+	draw_target := #screen2;
 
 	// One-time full-screen capture into the permanent pristine reference
 	// -- see bg_pristine's own declaration comment and CaptureBgPristine's
 	// own comment for why this is now a single whole-buffer blit instead
 	// of the old per-plane BlitSave(0, 0, 20, 256, 3, #bg_pristine) call.
+	// Reads from #screen -- either buffer would do, since both are
+	// identical at this point (nothing has been drawn on top of either
+	// yet).
 	CaptureBgPristine();
 
 	// Pre-render each entity's solid-color sprite once. Real per-entity
@@ -2159,7 +2556,7 @@ begin
 	// count directly (see its own rewrite comment -- the interleaved
 	// layout's per-plane-chunk lookahead word replaces the old hidden
 	// padding ROW entirely).
-	BuildSprite(#player_sprite, PLAYER_SPR_WORDS*2, PLAYER_SPR_H, 5);
+	BuildSprite(#player_sprite, PLAYER_SPR_WORDS*2, PLAYER_SPR_H, 2);
 	BuildSprite(#enemy_sprite, ENEMY_SPR_WORDS*2, ENEMY_SPR_H, 7);
 	BuildSprite(#attack_sprite, ATTACK_SPR_WORDS*2, ATTACK_SPR_H, 6);
 	// Real (non-rectangular) shape via masking, replacing the earlier
@@ -2182,7 +2579,7 @@ begin
 
 	// No more "prime the save buffers" step here: bg_pristine (captured
 	// above, right after DrawBackground()) is already valid for the very
-	// first RestoreEntities() call at the top of the loop below -- unlike
+	// first RestoreEntitiesDB() call at the top of the loop below -- unlike
 	// the old per-entity save buffers, it doesn't need a frame-zero
 	// priming call to have something correct to restore from.
 
@@ -2209,10 +2606,13 @@ begin
 		// erased at the NEW position instead of the old one, leaving the
 		// previous frame's drawn content never properly cleaned up,
 		// visible as a horizontal trail/dashing along the enemy's patrol
-		// path. Reverted.) So the whole Restore..Draw block is deferred
-		// together, behind the line-254 wait, in its original order --
-		// there's ample headroom for this, so nothing is lost by
-		// deferring Update/Check along with the screen-touching calls.
+		// path. Reverted.) So the whole Restore..Draw block stays together
+		// in its original order. It used to ALSO be deferred behind a
+		// line-254 raster wait (WaitForVisibleEnd) to avoid racing the
+		// beam -- that wait is gone under double buffering (see its
+		// removal comment below): Restore/Draw now write into draw_target,
+		// never the buffer currently on screen, so there's no beam left to
+		// race regardless of when in the frame this block runs.
 		ProfMark($0F00); // red: input
 		ReadKeyboard();
 
@@ -2236,8 +2636,8 @@ begin
 		// Gameplay collision. Both must run AFTER Update* (they read the
 		// new positions) and before Draw. CheckPlayerAttackHits clears an
 		// enemy by setting e_alive[i]:=0, which both stops it being drawn
-		// and stops RestoreEntities erasing at its last position -- that is
-		// correct, because the last thing drawn there was erased by the
+		// and stops RestoreEntitiesDB erasing at its last position -- that
+		// is correct, because the last thing drawn there was erased by the
 		// restore at the top of THIS frame, before the kill happened.
 		//
 		// NOTE FOR CAPACITY TESTING: with these enabled the live enemy
@@ -2247,9 +2647,16 @@ begin
 		// flatter itself.
 		CheckPlayerAttackHits();
 		CheckEnemyAttackHits();
-		
-		ProfMark($0888); // neutral: deliberately waiting for line 254
-		WaitForVisibleEnd();
+
+		// WaitForVisibleEnd() is GONE here under double buffering, and
+		// deliberately not just skipped but removed from this path: the
+		// whole reason it existed was to avoid touching the buffer the
+		// beam is currently scanning out. RestoreEntitiesDB/DrawPlayer/
+		// DrawEnemies below all write into draw_target -- the buffer that
+		// is, by construction, never the one currently displayed -- so
+		// there is no beam to race and no raster deadline left at all
+		// (see CLAUDE.md's "double buffering" notes). The procedure itself
+		// is left declared, unused, as a single-buffer fallback/reference.
 
 		// Blitter Nasty, CPU-scoped (NASTY_MODE=2) -- see NASTY_MODE's own
 		// declaration comment. Scoped to exactly the deferred blit block
@@ -2263,40 +2670,45 @@ begin
 			BlitterNastyOn();
 		end;
 
-		// No save phase: RestoreEntities pulls from the one-time bg_pristine
-		// capture in the setup block, so there is nothing to snapshot per
-		// frame. See bg_pristine own declaration comment.
-		ProfMark($0F0F); // magenta: restore (needs OLD positions -- must run before Update)
-		RestoreEntities();
+		// No save phase: RestoreEntitiesDB pulls from the one-time
+		// bg_pristine capture in the setup block, so there is nothing to
+		// snapshot per frame. See bg_pristine's own declaration comment.
+		// RestoreEntitiesDB (not RestoreEntities) reads cur_buf's own
+		// position HISTORY, not the live px/py/ex/ey/atk_* globals -- see
+		// its own declaration comment for why that distinction matters
+		// under double buffering.
+		ProfMark($0F0F); // magenta: restore (needs THIS BUFFER's own last-drawn positions -- must run before Update)
+		RestoreEntitiesDB();
 
 		// Restore -> Update -> Draw, the order CLAUDE.md says must never be
-		// broken. Deferring the WHOLE block behind the line-254 wait (rather
-		// than splitting it by "touches the screen or not") is the documented
-		// fix: Update*/Check* don't touch the screen, but they DO rewrite the
-		// positions Restore depends on, so they cannot be hoisted above it
-		// however tempting that looks.
-		ProfMark($00F0); // green: game logic (update/collision) -- changes positions
+		// broken: RestoreEntitiesDB needs cur_buf's OLD (history) positions,
+		// still untouched at this point, and Update*/Check* rewrite the live
+		// px/py/ex/ey/atk_* globals that DrawPlayer/DrawEnemies (and
+		// SaveBufferPositions, right after) depend on next -- so Update/Check
+		// cannot be hoisted above Restore however tempting that looks. No
+		// longer deferred behind a raster-line wait (see WaitForVisibleEnd's
+		// removal above) -- that was a single-buffer-only concern; this
+		// ordering requirement is unrelated to it and still applies.
+		//ProfMark($00F0); // green: game logic (update/collision) -- changes positions
+		ProfMark($0F0F); // magenta: game logic (update/collision) -- changes positions
 		UpdatePlayer();
 		UpdateEnemies();
 
 
-		// *** DRAW ORDER IS LOAD-BEARING -- DO NOT REORDER CASUALLY. ***
-		// Player FIRST, enemies last. This is not a style choice and not
-		// the old "goes-first" flashing diagnostic (that was the reverse,
-		// enemy-first, and is what used to be here): it is the fix for the
-		// raster-deadline race described in CLAUDE.md.
-		//
-		// Everything drawn here is racing the beam. The redraw window runs
-		// from draw_start_line (204) to the raster line at which an entity
-		// is displayed; whatever is drawn LAST is the first to miss that
-		// deadline and vanish for the frame. Enemies never move vertically
-		// (ey[i] is fixed at 160), so their deadline is constant and is the
-		// latest one on screen. The player DOES move vertically and jumps,
-		// so the higher it goes the earlier its deadline -- which makes it
-		// the entity that must be drawn first. With this reversed, the
-		// player disappeared above screen line ~104 once 5 enemies were on
-		// screen; player-first fixed it.
-		ProfMark($0FF0); // yellow: draw (needs NEW positions)
+		// *** Player-first, enemies-last draw order -- NO LONGER LOAD-
+		// BEARING, kept only because there's no reason to touch it. ***
+		// This ordering was originally the fix for a raster-deadline race
+		// (see CLAUDE.md): under single buffering, everything drawn here
+		// was racing the beam, and whatever drew LAST was first to miss
+		// its deadline and vanish for the frame. Double buffering removes
+		// that deadline entirely -- draw_target is never the buffer
+		// currently being scanned out (see WaitForVisibleEnd's removal
+		// above and FlipBuffer's own comment), so there is no beam left to
+		// race and this order could be swapped freely. Left as player-
+		// first anyway: no benefit to changing it, and it's one less thing
+		// to have re-verified.
+		//ProfMark($0FF0); // yellow: draw (needs NEW positions)
+		ProfMark($0E00); // dark red: draw (needs NEW positions)
 
 		DrawPlayer();
 		DrawEnemies();
@@ -2307,8 +2719,42 @@ begin
 			BlitterNastyOff();
 		end;
 
-		ProfMark($0888); // back to neutral -- marks "done, waiting for vblank"
-		//WaitVBlankIRQ();
+		// Commit this frame's positions into cur_buf's own history (needed
+		// the next time this buffer becomes the back buffer, two frames
+		// from now -- see SaveBufferPositions' own comment), THEN flip:
+		// make cur_buf's now-fully-drawn buffer the new front buffer and
+		// swap cur_buf/draw_target for the next iteration. FlipBuffer
+		// itself waits for DrawEnemies' last, still-in-flight blit to
+		// actually finish before flipping -- see its own comment.
+		SaveBufferPositions();
+		FlipBuffer();
+
+		//ProfMark($0888); // back to neutral -- marks "done, waiting for vblank"
+		ProfMark($0F00); // back to red -- marks "done, waiting for vblank"
+
+		// RE-ENABLED for double buffering -- this was commented out for
+		// bandwidth stress-testing (see CLAUDE.md), which pre-dates
+		// FlipBuffer entirely and was fine to run unthrottled: nothing
+		// else in the old single-buffer loop wrote into the copper's own
+		// program. FlipBuffer does -- it pokes copper_bitplane0/1/2's
+		// stored operand words directly (see its own comment). The copper
+		// re-executes that exact instruction once per real vblank,
+		// completely independently of our CPU loop's speed. With the loop
+		// unthrottled, FlipBuffer could fire hundreds of times between two
+		// real vblanks, each one rewriting those words via two separate
+		// 16-bit writes (high word, then low word) -- with no relationship
+		// to when the copper itself reads them. That's a real race: the
+		// copper can catch a torn pointer (mismatched high/low halves)
+		// mid-write, which reads as exactly the reported symptoms -- an
+		// intermittent burst of garbage/shifted background (a torn
+		// pointer, for one frame), and border-flash "two patterns" (the
+		// CPU racing ahead of the display by an unpredictable amount each
+		// real frame instead of a consistent one flip per vblank). Gating
+		// FlipBuffer behind WaitVBlankIRQ() (so it fires at most once per
+		// real vblank, with a whole frame's margin before the copper next
+		// reaches line 44) removes the race entirely -- see FlipBuffer's
+		// own comment for why a single well-timed poke is already safe.
+		WaitVBlankIRQ();
 	end;
 
 end.

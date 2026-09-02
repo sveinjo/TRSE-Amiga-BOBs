@@ -26,7 +26,21 @@ There was a strong suspicion that we could increase this further by doing fewer 
 
 
 
-This, combined with turning on the so called "blitter nasty" flag gave us 7 moving objects, which is pretty close. 
+This, combined with turning on the so called "blitter nasty" flag gave us 7 moving objects, which is pretty close.
+
+
+
+But at this stage tearing was becoming a problem, and to solve this double buffering was implemented. This gave us 8 moving objects flicker free, and I think that is probably the limit of the blitter's capabilities at 60 frames per second at this size.
+
+Changing object size can of course give even more or less objects. Blitter bandwidth is the key constraint.
+
+
+
+
+
+
+
+
 
 
 
