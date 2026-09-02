@@ -94,13 +94,297 @@ var
 	// ------------------------------------------------------------------
 	// Screen / palette
 	// ------------------------------------------------------------------
-	// 6 planes, not 5: plane index 5 is the EHB half-bright/"shadow" plane
-	// -- see the EHB setup block in "Main" below for the full mechanism.
-	screen : array[40*256*6] of byte chipmem;
+	// ------------------------------------------------------------------
+	// INTERLEAVED-BITPLANE REWRITE (in progress, started after the
+	// wide-enemy/EHB performance investigation -- see CLAUDE.md's "Next
+	// steps"). Only the background and the original (32x64) enemies are
+	// ported to this layout so far; the player, its attack box, EHB's
+	// shadow plane, and the experimental wide-enemy test entity are NOT
+	// YET ported -- grep "PRE-REWRITE" for exactly what still assumes the
+	// OLD true-planar layout below and would need porting (or at least
+	// re-verifying) before being revived/uncommented.
+	//
+	// Each screen ROW now stores all NUM_PLANES planes' bytes back to
+	// back (plane0's 40 bytes, then plane1's 40, then plane2's 40, then
+	// the next row starts) -- NOT one big contiguous PLANE_SIZE-byte
+	// block per plane, the way the old (still-used-by-reference-code-
+	// only) layout below worked. This is what lets a WHOLE multi-plane
+	// entity be moved in ONE blitter operation instead of one per plane:
+	// walking forward by a fixed "(40 - chunk_width)" modulo after each
+	// plane's worth of a row lands you at the same byte column of the
+	// NEXT plane (same row) or plane 0 of the NEXT row, indistinguishably
+	// -- both are just "skip to the start of the next 40-byte block" in
+	// this layout, since planes are packed edge-to-edge with no gaps. See
+	// BlitStampMasked/BuildSprite/BuildBoxMask's own rewrite comments for
+	// the full mechanism.
+	//
+	// NUM_PLANES is 3, not 6: EHB's extra 3 planes are deferred along
+	// with the rest of EHB (see EHB_ENABLED's own comment) -- reconciling
+	// EHB's fixed 6-plane requirement with interleaving is real, open
+	// design work saved for when EHB is revisited, not attempted here.
+	//
+	// NOTE ON NAMING: TRSE's own doc comment for Graphics::
+	// SetupDefaultScreen (the built-in that sets up exactly this layout
+	// -- see Main's setup block) calls this "interlaced," which is a
+	// terminology collision worth flagging: this has nothing to do with
+	// real video-field interlacing (alternating odd/even scanlines across
+	// two fields). It means bitplanes INTERLEAVED in memory by scanline.
+	// Naming kept as NUM_PLANES/ROW_STRIDE here to avoid that ambiguity.
+	const NUM_PLANES:integer = 3;
+
+	// EHB (Extra Half-Brite) shadow layer toggle -- see the EHB setup
+	// block in "Main" and VBlank() for the full mechanism. Still fully
+	// PRE-REWRITE/dormant -- EHB's whole 6-plane mechanism hasn't been
+	// reconciled with the interleaved layout yet, so this has no live
+	// effect right now regardless of its value. Deliberately NOT declared
+	// "const": confirmed via direct assembly inspection that
+	// "if (CONST_NAME=literal)" against a NAMED const doesn't reliably
+	// select the right branch in this compiler -- the comparison got
+	// compiled away entirely, always falling into the "true" branch
+	// regardless of the const's actual declared value (0 in that test),
+	// leaving the "false" branch as permanently dead code. A genuinely
+	// new TRSE bug -- worth reporting upstream alongside this project's
+	// other confirmed miscompilations (see "Should any of this be
+	// reported").
+	EHB_ENABLED:integer = 0;
+	// LIVE KNOB, reconnected to the real screen setup (see Main's setup
+	// block) -- how many bitplanes the DISPLAY actually fetches per
+	// scanline, independent of NUM_PLANES above (how many of those planes
+	// our OWN color budget/entity-drawing code fills with real content).
+	// Raising this lets you reproduce the pre-rewrite EHB-era finding
+	// ("more displayed bitplanes cost real DMA even when nothing writes
+	// to them") under the new interleaved layout -- the extra planes
+	// beyond NUM_PLANES are zero-filled padding: BuildBoxMask/BuildSprite/
+	// FastFillBand/BlitFillRect leave them untouched (0), and
+	// BlitStampMasked's mask channel being 0 there makes those blitter
+	// sub-rows harmless no-ops (D=C, "leave background as-is") rather than
+	// corrupting anything.
+	// CONSTRAINTS (not runtime-enforced, same spirit as NUM_WIDE_ENEMIES's
+	// array-capacity constraint elsewhere in this file):
+	//  - Must be >= NUM_PLANES (3) -- going lower starves the real
+	//    background/entity color planes of memory and re-creates the
+	//    "missing sky/floor" symptom this rewrite already hit once.
+	//  - Must be <= 5 -- Graphics::SetupDefaultScreen's .tru implementation
+	//    (see Main's setup block) only has branches for bpl=1..5; 6+ would
+	//    need EHB's own manual-poke technique, which is a separate,
+	//    dormant code path, not this knob.
+	// UNLIKE EHB_ENABLED, this one MUST stay "const": ROW_STRIDE and every
+	// sprite/mask/screen buffer size below are computed from it, and array
+	// bounds need a genuine compile-time constant -- a plain "var" simply
+	// wouldn't work here (untested whether TRSE would even error cleanly
+	// or silently misbehave; not worth finding out). This is safe despite
+	// gotcha #13 because every use of it in this file is either a FOR-loop
+	// bound (`for fpl:=0 to DISPLAY_BITPLANES do`, the same shape
+	// NUM_ENEMIES/NUM_WIDE_ENEMIES already use safely throughout this
+	// file) or a plain array-size multiplication -- never the specific
+	// "if (CONST_NAME=literal)" equality-comparison shape gotcha #13
+	// actually confirmed broken. Deliberately did NOT write
+	// "if (DISPLAY_BITPLANES>3)"-style comparisons anywhere for the
+	// padding-plane logic (see FastFillBand's rewrite comment) specifically
+	// to avoid relying on an untested comparison shape against a const.
+	// Also MUST be declared before ROW_STRIDE below, since ROW_STRIDE's
+	// own value now depends on it (TRSE's single-pass declaration order,
+	// same reason NUM_PLANES precedes ROW_STRIDE).
+	const DISPLAY_BITPLANES:integer = 3;
+
+	const ROW_STRIDE:integer = 40*DISPLAY_BITPLANES;   // bytes per screen row, ALL planes (real + padding) together
+	screen : array[ROW_STRIDE*256] of byte chipmem;
+
+	// LIVE KNOB, picks which entity blit technique DrawEnemies/DrawPlayer/
+	// RestoreEntities use -- see BlitStampMaskedPerPlane/
+	// RestoreFromPristinePerPlane's own comments for the full reasoning.
+	// 0 = BlitStampMasked/RestoreFromPristine (the fast single-blit-per-
+	// entity path) -- correct AND fastest when DISPLAY_BITPLANES=NUM_PLANES
+	// (the default), but pays for walking DISPLAY_BITPLANES sub-rows per
+	// row (including always-empty padding ones) once DISPLAY_BITPLANES is
+	// raised, even though only NUM_PLANES of them ever hold real content.
+	// 1 = BlitStampMaskedPerPlane/RestoreFromPristinePerPlane -- NUM_PLANES
+	// separate per-plane blitter operations instead of one, costing more
+	// at DISPLAY_BITPLANES=NUM_PLANES (this project's ORIGINAL pre-single-
+	// blit cost) but INDEPENDENT of DISPLAY_BITPLANES's value, so it's the
+	// one to use once DISPLAY_BITPLANES is being raised for real (more
+	// total on-screen colors) rather than as a temporary DMA-cost probe.
+	// Declared as a plain variable, not "const": every call site compares
+	// it with "=1", the exact shape already proven safe for EHB_ENABLED
+	// and unsafe for named consts (gotcha #13) -- no array sizes depend on
+	// this one, so there's no reason to accept that risk here.
+	ENTITY_BLIT_MODE:integer = 0;
+
+	// ------------------------------------------------------------------
+	// LIVE KNOB: pre-shifted sprites.
+	// 0 = runtime barrel shift (BlitStampMasked/BlitStampMaskedPerPlane
+	//     against *_mask/*_sprite) -- the original, proven path.
+	// 1 = pre-shifted (BlitStampMaskedPS against *_mask_ps/*_sprite_ps):
+	//     NUM_SHIFTS pre-drawn copies of each mask, one per sub-word pixel
+	//     offset, so the per-frame blit needs no ASH/BSH and no lookahead
+	//     word. Narrows every entity blit from (*_SPR_WORDS+1) words to
+	//     *_SPR_WORDS -- 4 -> 3 for the 32px entities, i.e. ~25% off both
+	//     the masked draw AND the pristine restore. Costs chip RAM (see
+	//     player_mask_ps's declaration comment) and startup time.
+	//
+	// SPRITE_MODE=1 implies the single-blit-per-entity technique and
+	// IGNORES ENTITY_BLIT_MODE -- there is no per-plane pre-shifted
+	// variant, because the two exist for opposite reasons (ENTITY_BLIT_MODE
+	// =1 is only for DISPLAY_BITPLANES > NUM_PLANES, which is not the
+	// configuration anyone reaches for pre-shifting in). If both are ever
+	// wanted together, BlitStampMaskedPerPlane needs its own PS sibling.
+	//
+	//
+	// TESTED, THEN REVERTED TO 0 -- pre-shifting is kept as a dormant
+	// reference path, not the live one. It was built, it renders, and it is
+	// not worth its costs here:
+	//  - It did NOT raise the NUM_ENEMIES ceiling at all (still 6), despite
+	//    genuinely moving ~25% less data per entity. That is the important
+	//    result, and it invalidates the premise this optimisation was chosen
+	//    on: the ceiling is NOT blitter data volume. Don't reach for another
+	//    "move fewer bytes" idea until something actually identifies what
+	//    the 6-enemy limit really is.
+	//  - Startup pre-generation (16 variants x 3 entities, drawn per-pixel)
+	//    is slow enough to be user-visible and annoying.
+	// Everything stays compiled and correct, so flipping this to 1 re-enables
+	// it -- but note the PS build calls in the setup block are gated on this
+	// too, so at 0 they cost nothing, which is the point.
+	//
+	// Plain variable, not "const": every use is an "=1" comparison, the
+	// shape gotcha #13 confirms is broken for named consts.
+	//
+	// *** DO NOT SET THIS TO 1 WITHOUT READING THIS -- IT WOULD NOW CORRUPT
+	// *** MEMORY, NOT MERELY RENDER WRONG.
+	// The *_SPR_WORDS constants have since been trimmed to their true
+	// minimum, ceil(BOX_W/16) -- see the SPRITE WIDTH SIZING RULE further
+	// down. That is correct for barrel shifting, which takes its slack from
+	// the blit's own +1 lookahead word, but it is NOT enough for
+	// pre-shifting: BuildBoxMaskPS draws the box starting at bit k for k up
+	// to 15 with no lookahead word at all, so it needs the OLD
+	// ceil((BOX_W+15)/16) width. At today's sizes a PS variant would write
+	// ~47 bits into a 32-bit chunk, running off the end of every chunk and
+	// eventually past the buffer. To revive PS, restore *_SPR_WORDS to the
+	// +15 formula FIRST (which also shifts the *_BOX_LEFT values the
+	// ClampWordCol call sites derive from), or better, give the PS buffers
+	// their own width constants so the two schemes stop sharing one number.
+	// Same class of hazard as the deferred EHB and wide-enemy code:
+	// dormant, and unsafe to wake carelessly.*/
+	SPRITE_MODE:integer = 0;
+
+	// Number of pre-shifted variants: one per sub-word pixel offset a
+	// word-aligned blit can leave uncovered, so this is 16 and is not a
+	// tuning knob -- ClampWordCol's shift_result is (x & 15), 0..15.
+	// Safe as a real "const": only ever used as an array-size multiplier
+	// and as a "for" loop bound, never as the subject of an "if" (gotcha
+	// #13), exactly like DISPLAY_BITPLANES.
+	const NUM_SHIFTS:integer = 16;
+
+	// ------------------------------------------------------------------
+	// LIVE KNOB: "Blitter Nasty" (BLTPRI) -- DMACON bit 10 ($0400).
+	//
+	// READ THIS FIRST, it is the single most important fact here: blitter
+	// nasty is NOT BLTCON1 bit 1. BLTCON1 bit 1 is DESC (descending-mode
+	// control, which runs the blitter backwards through its pointers) --
+	// setting it while the pointers are still set up for an ascending blit
+	// produces exactly the "garbage output" symptom, which is why an
+	// earlier attempt at this went wrong. The real priority flag lives in
+	// DMACON ($dff096), bit 10, and is set/cleared with DMACON's usual
+	// SET/CLR convention:
+	//     set   BLTPRI:  move.w #$8400,$dff096
+	//     clear BLTPRI:  move.w #$0400,$dff096
+	// Nothing else in DMACON is touched by either write (the register is
+	// bit-masked), so this can never disturb DMAEN/BPLEN/COPEN/BLTEN.
+	//
+	// What it actually does: with BLTPRI CLEAR (the default), Agnus lets
+	// the 68000 steal a bus cycle whenever it has been blocked out for a
+	// few consecutive cycles, so a fully-packed blit loses a real slice of
+	// its cycles to the CPU. With BLTPRI SET, the CPU only gets the cycles
+	// the blitter genuinely does not want. It changes NOTHING about the
+	// copper, bitplane fetch, sprites, audio or disk -- all of those
+	// outrank the blitter in Agnus's priority chain regardless of BLTPRI,
+	// so the copper list and the display can never be broken by this. The
+	// CPU is the one and only victim.
+	//
+	// Why this is safe here, despite "locks the CPU out of chip RAM"
+	// sounding alarming: BLTPRI has NO effect at all while the blitter is
+	// idle -- it only reprioritises cycles during an actual blit -- and
+	// every blit in this program is finite and short, so the CPU can never
+	// be starved indefinitely and there is no deadlock to construct.
+	// Worst case the CPU simply runs slower for the duration of a blit --
+	// and during exactly that window this program's CPU is doing nothing
+	// but spinning in a BBUSY busy-wait (see BlitStampMasked et al.)
+	// waiting for that same blit to finish. That spin loop is precisely
+	// what BLTPRI stops from stealing cycles, which is why this project is
+	// close to the ideal case for it.
+	//
+	// 0 = off (baseline, exactly this project's behaviour before BLTPRI).
+	// 1 = COPPER-scoped (recommended, and what was asked for): the copper
+	//     clears BLTPRI at raster line 44 (DIWSTRT, first visible line)
+	//     and sets it again at nasty_on_line, so the blitter owns the bus
+	//     for the whole bottom-border + vertical-blank window where this
+	//     program does all its blitting, and the CPU is guaranteed its
+	//     normal share throughout the visible display -- enforced by
+	//     hardware, so a blit overrunning into the visible area cannot
+	//     leave nasty stuck on. See InstallNastyCopper.
+	// 2 = CPU-scoped: BlitterNastyOn/Off called around the deferred
+	//     Restore..Draw block in the main loop. Simpler, scopes exactly to
+	//     the blitting code rather than to raster position, and is a
+	//     useful A/B control for mode 1 -- if 1 and 2 measure the same,
+	//     the copper writes are landing correctly.
+	// 3 = ALWAYS ON (the default). BLTPRI is set ONCE at the end of the
+	//     setup block and never cleared again -- no copper list involved,
+	//     no per-frame register poke, nothing that can be half-configured.
+	//     This is the "just make it definitely on" setting, and it is the
+	//     right one while the CPU has nothing to do but wait out the
+	//     blitter: BLTPRI is inert whenever the blitter is idle, so
+	//     "always on" costs literally nothing outside the blit block.
+	//     Reach for mode 1 or 2 only once there is real CPU work that
+	//     needs its bus cycles back during blits.
+	//
+	// WHY THIS REPLACED "mode 1 with nasty_on_line = 0" AS THE DEFAULT:
+	// that combination did work, but only via a subtlety -- a copper WAIT
+	// is a ">=" comparison, so WAIT(VP=0) is satisfied instantly, meaning
+	// the copper cleared BLTPRI at line 44 and then immediately set it
+	// again on the very next instruction. Correct, but it depends on
+	// hardware semantics that are easy to misread, and it leaves BLTPRI
+	// briefly clear every frame for no reason. Mode 3 states the intent
+	// directly instead. Nothing else in the program writes DMACON during
+	// the run (verified in main.asm -- the only other write is the exit
+	// path restoring the OS's original DMACON), so once set it stays set.
+	//
+	// Plain variable, not "const": every use is an "=N" comparison, the
+	// exact shape gotcha #13 confirms is broken for named consts.
+	NASTY_MODE:integer = 3;
+
+	// Raster line at which the copper turns BLTPRI ON (mode 1 only). The
+	// copper turns it back OFF at line 44 unconditionally, so this is the
+	// only end of the window that needs tuning. Default matches
+	// draw_start_line (204) so nasty covers the whole deferred blit block
+	// rather than only the part of it that happens after DIWSTOP -- during
+	// the active display the blitter is already sharing with bitplane
+	// fetch, and letting it also win the CPU's cycles there is worth more
+	// than the CPU's own crawl (this program's per-entity CPU setup work
+	// is roughly an order of magnitude cheaper than the blit it sets up).
+	// Raise toward 254 (the empirically-found DIWSTOP, see RulerSweep) to
+	// keep the CPU at full speed for the whole visible region instead.
+	// Must stay <= 255: the copper's VP field is 8 bits and this is poked
+	// into a plain WAIT without the $ffdf past-line-255 trick.
+	nasty_on_line : integer = 0;
+
+	// PRE-REWRITE: kept only so the OLD true-planar reference procedures
+	// still compile (SetPixel, SaveBlock/RestoreBlock, BlitStamp,
+	// BlitSave, ClampByteCol, the *_CPU procedures, DrawPlayerBuiltinBlit,
+	// BlitStampMasked1Plane/the wide-enemy code, and the old
+	// SaveEntityBackgrounds()-based restore/save path). These address
+	// #screen assuming the OLD layout (one contiguous PLANE_SIZE-byte
+	// block per plane) and are NOT interleaved-aware -- calling any of
+	// them against the NEW #screen buffer above would corrupt memory
+	// (e.g. "plane 1" at PLANE_SIZE offset doesn't exist there anymore).
+	// None of them are called from the live main loop right now
+	// (confirmed: DrawPlayer/UpdatePlayer/UpdateWideEnemy/DrawWideEnemy/
+	// RestoreWideEnemy are all already commented out) -- do NOT uncomment
+	// any of them, or flip EHB_ENABLED back on, without porting to the
+	// interleaved layout first (see Main's setup block comment for the
+	// concrete overflow this would cause).
+	const PLANE_SIZE:integer = 40*256;
 	// One-time scratch pointer for manually setting BPL6PTH/PTL at setup
-	// -- see the EHB setup block in "Main" for why this needs doing by
-	// hand (SetupNonInterlacedScreen's own .tru implementation has no
-	// branch past bpl=5).
+	// -- PRE-REWRITE/deferred along with the rest of EHB, see Main's
+	// setup block and VBlank()'s own comments.
 	ehb_bpl5 : pointer of byte;
 
 	// DIAGNOSTIC: every entry set to a distinct, non-black color (even
@@ -116,14 +400,18 @@ var
 
 	isDone : integer = 0;
 
-	// SetupNonInterlacedScreen lays out each bitplane as its own
-	// contiguous 40*256-byte block (true planar, not interleaved). A
-	// pixel (x,y) on plane p therefore lives at byte offset
-	// p*PLANE_SIZE + y*40 + (x>>3) from #screen.
-	const PLANE_SIZE:integer = 40*256;
+	// PRE-REWRITE: SetupNonInterlacedScreen's OLD true-planar layout,
+	// where each bitplane is its own contiguous 40*256-byte block and a
+	// pixel (x,y) on plane p lives at byte offset p*PLANE_SIZE + y*40 +
+	// (x>>3) from #screen. PLANE_SIZE itself is declared once, above,
+	// near the new NUM_PLANES/ROW_STRIDE (kept alongside them since both
+	// describe "how #screen is laid out," just for different code paths
+	// -- the pre-rewrite reference procedures vs. the live interleaved
+	// ones). See that declaration's own comment for which is which.
 
 	bittable    : array[8] of byte = (128,64,32,16,8,4,2,1);
 	notbittable : array[8] of byte = (127,191,223,239,247,251,253,254);
+
 
 	// ------------------------------------------------------------------
 	// World constants (downscaled: 1/3 horizontal, 2/3 vertical from the
@@ -132,35 +420,6 @@ var
 	const SCREEN_W:integer = 320;
 	const SCREEN_H:integer = 240;
 	const FLOOR_Y:integer = 160;      // top of the walkable floor "depth band"
-
-	// EHB (Extra Half-Brite) shadow layer toggle -- see the EHB setup
-	// block in "Main" and VBlank() for the full mechanism. 1 = shadow
-	// plane active (forces real 6-plane EHB mode, ignoring
-	// DISPLAY_BITPLANES below -- EHB structurally needs all 5 "real"
-	// planes' pointers valid regardless of how many of them our own
-	// color budget actually uses, plus the 6th as the half-bright flag).
-	// 0 = shadow off entirely -- no BPL6PTH poke, no copper_resolution
-	// override, no per-frame VBlank reset; DISPLAY_BITPLANES below is
-	// used as-is, exactly like before EHB existed. Still only ever
-	// changed by editing this file and rebuilding (same spirit as
-	// NUM_ENEMIES/NUM_WIDE_ENEMIES), but deliberately NOT declared
-	// "const": confirmed via direct assembly inspection that
-	// "if (CONST_NAME=literal)" against a NAMED const doesn't reliably
-	// select the right branch in this compiler -- the comparison got
-	// compiled away entirely, always falling into the "true" branch
-	// regardless of the const's actual declared value (0 in that test),
-	// leaving the "false" branch as permanently dead code. A genuinely
-	// new TRSE bug, not caught before now because every other
-	// conditional in this file compares a real variable, never a named
-	// constant. Worth reporting upstream alongside this project's other
-	// confirmed miscompilations (see "Should any of this be reported").
-	EHB_ENABLED:integer = 0;
-	// Real display bitplane count -- ONLY consulted when EHB_ENABLED=0.
-	// Try 3 (this project's normal budget), 4, or 5; with EHB_ENABLED=1
-	// this is ignored (always forced to a real 5 internally, then bumped
-	// to 6 for the shadow flag) since EHB doesn't have a notion of
-	// "N real planes" independent of the fixed 5+1 split.
-	const DISPLAY_BITPLANES:integer = 5;
 
 	// Tested at 1 (matching enemy's speed/shift parity) to check whether
 	// the "top line flashes when moving" artifact was tied to shift_result
@@ -206,7 +465,30 @@ var
 	// this compiler (see tutorial4_3D.ras: "TRSE doesn't support signed
 	// compare yet"). Every value here and everywhere else in this
 	// program is kept non-negative for that reason.
-	jump_table : array[16] of byte = (0,6,11,16,20,24,27,29,29,27,24,20,16,11,6,0);
+	// DELIBERATELY "of integer", not "of byte", even though every value
+	// fits in a byte -- this was a real memory-corruption crash, see below.
+	// Reading a BYTE array element into an INTEGER variable
+	// ("jump_height := jump_table[jump_frame]") compiles WITHOUT
+	// zero-extending the loaded byte:
+	//     move.w jump_frame,d1
+	//     lea jump_table,a0
+	//     move.b (a0,d1),d0      <-- sets only d0 bits 0-7
+	//     move.w d0,jump_height  <-- stores all 16 bits
+	// d0's high byte keeps whatever scratch garbage the previous
+	// expression left there, so jump_height came out as
+	// (garbage<<8)|jump_table[n] -- routinely in the thousands. That fed
+	// "py - jump_height - 64" as a blitter destination ROW, sending
+	// BlitStampMasked/RestoreFromPristine's writes far outside #screen:
+	// random garbage all over the display, escalating to a hard crash as
+	// the corruption spread. Note the compiler DOES zero-extend the array
+	// INDEX one line earlier ("move.l #0,d1"), just not the loaded value --
+	// an asymmetry that makes this easy to miss when skimming.
+	// Declaring the array at the same width as its destination removes the
+	// mixed-width load entirely (integer arrays with initialisers are used
+	// throughout this file -- ex/ey/bld_x/palette -- and are proven fine).
+	// This is the mirror image of gotcha #11 (byte-array STORE from an
+	// integer source reading the wrong byte); see gotcha #14.
+	jump_table : array[16] of integer = (0,6,11,16,20,24,27,29,29,27,24,20,16,11,6,0);
 
 	// ------------------------------------------------------------------
 	// Keyboard
@@ -245,26 +527,41 @@ var
 	pcolor : integer;
 
 	// ------------------------------------------------------------------
-	// Enemy state (3 enemies, parallel arrays)
+	// Enemy state (parallel arrays)
 	// ------------------------------------------------------------------
-	// Temporarily reduced from 3 to ease per-frame blitter load while the
-	// per-pixel shift work is in progress (more blits per shifted draw
-	// now than the old plain word-aligned copy) -- the ex/ey/e_* arrays
-	// below still have 3 slots, so bumping this back to 3 later is safe.
-	// Dropped to 1 temporarily (from 2) to rule out two nearby enemies'
-	// rectangles overlapping as a confound while isolating the shift/chop
-	// color artifact -- bump back up once that's resolved.
-	const NUM_ENEMIES:integer = 3;
-	ex : array[6] of integer = (80,160,240,90,150,230);
-	ey : array[6] of integer = (160,160,160,160,160,160);
-	e_alive       : array[6] of byte = (1,1,1,1,1,1);
-	e_facing      : array[6] of byte = (0,0,0,0,0,0);
-	e_dir         : array[6] of byte = (1,0,1,0,0,0);
-	e_chasing     : array[6] of byte = (0,0,0,0,0,0);
-	e_attacking   : array[6] of byte = (0,0,0,0,0,0);
-	e_hit_flag    : array[6] of byte = (0,0,0,0,0,0);
-	e_attack_timer    : array[6] of integer = (0,0,0,0,0,0);
-	e_attack_cooldown : array[6] of integer = (0,0,0,0,0,0);
+	// Capacity raised to 16 slots, matching wide_enemy's own array
+	// capacity (wex/wey/we_dir below) -- same goal as that earlier test:
+	// see how far a "fewer, bigger blits" capacity push goes for the
+	// REAL (32x64, 3-plane masked) enemies, now that the interleaved
+	// rewrite's single-blit-per-entity mechanism (see BlitStampMasked) has
+	// cut blitter operations per enemy further still. NUM_ENEMIES starts
+	// at 16 (the full capacity) so the ceiling can be found directly by
+	// watching for the same DMA-bandwidth-ceiling color artifacts the
+	// wide-enemy test used as its signal -- dial back down if 16 visibly
+	// breaks down, the same "temporarily reduced, bump back up later"
+	// spirit this comment block has carried through several earlier
+	// capacity experiments.
+	// NOTE: this section was found reverted to a stale pre-16-slot state
+	// (NUM_ENEMIES=10 against still-6-slot arrays -- a live out-of-bounds
+	// read/write on ex[6..9]/e_alive[6..9]/etc., not just a lost edit) after
+	// a TRSE IDE save from a stale buffer overwrote it. Re-applied here --
+	// if this keeps happening, reload the file in the IDE before editing it
+	// there, or make array-capacity edits from one side only per session.
+	// Starting X positions spread evenly across the real safe patrol
+	// range (ENEMY_CLAMP_MIN..MAX = 32..287, step 17, matching
+	// WIDE_ENEMY_CLAMP_MIN..MAX's own even-spread convention below).
+	const NUM_ENEMIES:integer = 6;
+	ex : array[16] of integer = (132,149,166,183,200,217,234,151,168,185,202,219,236,253,270,287);
+	ey : array[16] of integer = (160,160,160,160,160,160,160,160,160,160,160,160,160,160,160,160);
+	e_alive       : array[16] of byte = (1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1);
+	e_facing      : array[16] of byte = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
+	// Alternating start direction, matching we_dir's own convention below.
+	e_dir         : array[16] of byte = (1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0);
+	e_chasing     : array[16] of byte = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
+	e_attacking   : array[16] of byte = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
+	e_hit_flag    : array[16] of byte = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
+	e_attack_timer    : array[16] of integer = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
+	e_attack_cooldown : array[16] of integer = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
 
 	// ------------------------------------------------------------------
 	// Wide enemy state -- EXPERIMENTAL (see WIDE_ENEMY_BOX_W's declaration
@@ -336,21 +633,120 @@ var
 	// revisiting.)
 	// Player: 32x64 box (gamecode.ras: RectOutline(px-16,
 	// py-jump_height-64, 32, 64, pcolor)). ceil((32+15)/16)=3.*/
-	const PLAYER_SPR_WORDS:integer = 3;   // 48px
+	// ===================== SPRITE WIDTH SIZING RULE =====================
+	// *_SPR_WORDS = ceil(BOX_W / 16).  NOT ceil((BOX_W+15)/16).
+	//
+	// This file previously documented the +15 version, and it was wrong --
+	// it double-counted the barrel shifter's slop against the lookahead
+	// word the blit ALREADY adds. Derivation, because this has now been got
+	// wrong twice: BuildBoxMask places the box flush RIGHT within the
+	// nominal width, at mboxleft = SPR_WORDS*16 - BOX_W. The blit is always
+	// mbeffw = SPR_WORDS+1 words wide. Shifting right by s (0..15) puts the
+	// content's last bit at SPR_WORDS*16 - 1 + s, i.e. at most
+	// SPR_WORDS*16 + 14 -- which always fits inside those SPR_WORDS+1 words
+	// (SPR_WORDS*16 + 16 bits). So the ONLY constraint is mboxleft >= 0,
+	// giving SPR_WORDS >= BOX_W/16. Anything larger blits a word that is
+	// guaranteed to be entirely transparent, every row, every frame.
+	// Confirmed empirically: 1/16, 2/32, 3/48, 4/64 all render correctly
+	// with no clipped edges and no shift artifacts.
+	//
+	// Trimming each entity by one word is a straight ~25% cut in blitter
+	// data (blit width 4 -> 3 words for the 32px entities), for free -- no
+	// extra memory, no startup cost. That is the same saving pre-shifted
+	// sprites were going to buy, without any of their costs.
+	//
+	// *** BOX_LEFT BELOW IS THE COUPLING THAT MAKES THIS SAFE. ***
+	// mboxleft is not just an internal detail of BuildBoxMask: the draw and
+	// restore call sites must subtract it when computing the destination
+	// word column, or the entity renders mboxleft pixels left of its real
+	// x. That subtraction used to be the hardcoded literals "-16"/"-16"/
+	// "-21", which silently stop matching the moment SPR_WORDS or BOX_W
+	// changes -- and the failure is invisible (no clipping, no artifact,
+	// just a wrong position that only shows up later as a collision
+	// mismatch). Deriving it here means the two can never drift apart.
+	// These reproduce the old literals exactly at the OLD sizes
+	// (48-32=16, 48-32=16, 64-43=21).
+	// ====================================================================
+	const PLAYER_SPR_WORDS:integer = 2;   // 32px; ceil(32/16)=2
 	const PLAYER_SPR_H:integer = 64;
 	const PLAYER_BOX_W:integer = 32;
+	const PLAYER_BOX_LEFT:integer = PLAYER_SPR_WORDS*16 - PLAYER_BOX_W;
 	// Enemy: resized to match the player's own 32x64 box exactly (was the
 	// original CPU debug box, 11x43). Same formula, same result.
-	const ENEMY_SPR_WORDS:integer = 3;   // 48px
+	//
+	// ================= BANDWIDTH-vs-OBJECT-COUNT EXPERIMENT =================
+	// Question being answered: is the entity ceiling set by TOTAL BYTES the
+	// blitter moves, or by PER-OBJECT overhead (procedure calls, ClampWordCol,
+	// BBUSY waits, ~12 register pokes and a blit start-up per operation)?
+	// I.e. are we actually saturating our bandwidth, or could we be pushing
+	// noticeably bigger objects for free?
+	//
+	// Method: widen the enemy box WITHOUT changing anything else, and re-run
+	// the capacity test. Width is the correct knob and height is NOT -- the
+	// draw row is ey[i]-ENEMY_SPR_H, so making entities TALLER moves them up
+	// the screen and therefore moves their raster deadline earlier, changing
+	// the very budget we are trying to measure. Widening leaves the occupied
+	// scanlines (and thus the 198-line window) completely untouched.
+	//
+	// Only these two constants change. Everything else follows automatically:
+	// buffer sizes, BuildSprite/BuildBoxMask/BuildBoxMaskInset, and the blit
+	// widths are all derived from them. Critically, the flush-right inset
+	// (mboxleft = ENEMY_SPR_WORDS*2*8 - ENEMY_BOX_W) stays exactly 16 for
+	// every row of this table, so the "-16" in DrawEnemies'/RestoreEntities'
+	// ClampWordCol calls stays correct and needs no edit:
+	//
+	//   BOX_W  SPR_WORDS  blit words   cycles/enemy/frame   mboxleft
+	//     32       3       3+1 = 4      4*192*(4+2) = 4608     16
+	//     64       5       5+1 = 6      6*192*(4+2) = 6912     16
+	//     96       7       7+1 = 8      8*192*(4+2) = 9216     16
+	//
+	// (192 = ENEMY_SPR_H * DISPLAY_BITPLANES sub-rows; 4 channels for the
+	// masked draw plus 2 for the pristine restore.)
+	//
+	// HOW TO READ THE RESULT. First establish N32, the max stable
+	// NUM_ENEMIES at BOX_W=32 with the player drawn. Then at BOX_W=64:
+	//   - N64 close to (2/3)*N32  -> purely bandwidth-bound. Total bytes
+	//     moved is constant, per-object overhead is negligible, and there is
+	//     nothing to win by making objects bigger/fewer. Double buffering is
+	//     then the only way forward.
+	//   - N64 clearly ABOVE (2/3)*N32 -> per-object overhead is real and we
+	//     are NOT saturating bandwidth. The headline number is total data:
+	//     if N64*6912 > N32*4608, that surplus is bandwidth we are currently
+	//     leaving unused, and bigger sprites are effectively free.
+	// BOX_W=96 is the confirming third point (predict N96 ~ N32/2 if
+	// bandwidth-bound). A straight line through all three means bandwidth; a
+	// curve that flattens means overhead.
+	//
+	// Caveat when reading the screen: at 64px and 96px the boxes overlap
+	// heavily at the current ex[] spacing (132,149,166,... step 17), which
+	// makes it harder to spot WHICH entity is failing. Overlap costs nothing
+	// extra to blit, so it does not affect the measurement -- but spreading
+	// ex[] out (e.g. step 32 from 32) makes the failure easier to see.
+	//
+	// SET BACK TO 3 / 32 WHEN THE EXPERIMENT IS DONE.
+	// ========================================================================
+	// RESULT: BANDWIDTH-BOUND, CONFIRMED. Capacity tracks blit width, i.e.
+	// it is set by how many BYTES the blitter moves rather than by
+	// per-object overhead -- so there is nothing to be won by making
+	// objects fewer and bigger, and double buffering is the way forward.
+	// The experiment also turned up something worth more than the
+	// experiment itself: the buffers were a word wider than barrel shifting
+	// actually needs, so every entity was blitting one guaranteed-
+	// transparent word per row. See the SPRITE WIDTH SIZING RULE above.
+	// Box stays 32px, now at its true minimum width of 2 words.
+	const ENEMY_SPR_WORDS:integer = 2;   // 32px; ceil(32/16)=2
 	const ENEMY_SPR_H:integer = 64;
 	const ENEMY_BOX_W:integer = 32;
+	const ENEMY_BOX_LEFT:integer = ENEMY_SPR_WORDS*16 - ENEMY_BOX_W;
 	// Attack: kept at its original outline size (gamecode.ras:
 	// RectOutline(atk_x-21, atk_y-10, 43, 21, 9)) -- only the blit
 	// technique (masking+shift) is being generalized here, not the size.
 	// ceil((43+15)/16)=4.
-	const ATTACK_SPR_WORDS:integer = 4;   // 64px
+	// ceil(43/16) = 3, so BOX_LEFT = 48-43 = 5 (was 4 words / BOX_LEFT 21).
+	const ATTACK_SPR_WORDS:integer = 3;   // 48px; ceil(43/16)=3
 	const ATTACK_SPR_H:integer = 21;
 	const ATTACK_BOX_W:integer = 43;
+	const ATTACK_BOX_LEFT:integer = ATTACK_SPR_WORDS*16 - ATTACK_BOX_W;
 
 	// Wide enemy: EXPERIMENTAL test entity, not a real gameplay addition --
 	// see CLAUDE.md's "Blitter performance/optimization" section for the
@@ -372,39 +768,111 @@ var
 	const WIDE_ENEMY_CLAMP_MIN:integer = 48;
 	const WIDE_ENEMY_CLAMP_MAX:integer = 255;
 
-	// (PLAYER_SPR_H+1)/(ENEMY_SPR_H+1)/(ATTACK_SPR_H+1): a shifted draw's
-	// last row reads one word beyond its own nominal row width for
-	// barrel-shift lookahead (see BlitStamp's beffw); on a tightly-packed
-	// buffer with no margin, that read lands in the START OF THE NEXT
-	// PLANE's data, visible as a wrong-colored sliver at the sprite's
-	// bottom edge. This extra row per plane is never actually drawn
-	// (BlitStamp/BuildSprite calls for the real blit still use the
-	// entity's own *_SPR_H) -- it exists purely so that stray read has
-	// somewhere safe, same-plane to land. Every sprite AND mask buffer
-	// below needs its own copy of this padding row now that all three
-	// entities shift. Only 3 planes' worth of storage (not 5) -- see
-	// BuildSprite's comment: planes 3-4 are never read or written by
-	// anything, so there's nothing to store for them.
-	player_sprite : array[PLAYER_SPR_WORDS*2*(PLAYER_SPR_H+1)*3] of byte chipmem;
-	// Mask for the player's real (non-rectangular) shape: a single
-	// bitplane, reused across all 3 color planes during the masked blit
-	// (1 = opaque/draw sprite color, 0 = transparent/leave background).
-	player_mask : array[PLAYER_SPR_WORDS*2*(PLAYER_SPR_H+1)] of byte chipmem;
-	enemy_sprite  : array[ENEMY_SPR_WORDS*2*(ENEMY_SPR_H+1)*3] of byte chipmem;
+	// REWRITTEN for the interleaved-bitplane layout -- see BuildSprite/
+	// BuildBoxMask's own rewrite comments for the full reasoning. Both
+	// sprite AND mask buffers now use the SAME size formula:
+	// (X_SPR_WORDS+1)*2 bytes per plane-chunk (real content + 1 genuine
+	// lookahead word, no more borrowing) * X_SPR_H (the TRUE row count,
+	// no more hidden "+1" padding row) * DISPLAY_BITPLANES (each real row
+	// now holds DISPLAY_BITPLANES back-to-back chunks, not just NUM_PLANES
+	// -- see DISPLAY_BITPLANES's own comment for why the padding planes
+	// beyond our 3-plane color budget need real buffer space too, even
+	// though only the first NUM_PLANES chunks per row ever get real
+	// content: sprite gets DIFFERENT per-plane fill values there (0 for
+	// padding, via the natural bscolor>>bp shift result); mask gets
+	// IDENTICAL copies of the outline for the first NUM_PLANES chunks and
+	// 0 (transparent/no-op) for the padding ones, see BuildBoxMask's
+	// comment for why that duplication is necessary). More mask memory
+	// than before (was 1x, then NUM_PLANES x, now DISPLAY_BITPLANES x),
+	// still trivial in absolute terms for buffers this size.
+	player_sprite : array[(PLAYER_SPR_WORDS+1)*2*PLAYER_SPR_H*DISPLAY_BITPLANES] of byte chipmem;
+	// Mask for the player's real (non-rectangular) shape (1 = opaque/draw
+	// sprite color, 0 = transparent/leave background) -- see the sizing
+	// comment above for why this is no longer just 1/DISPLAY_BITPLANES the
+	// size of player_sprite the way it used to be.
+	player_mask : array[(PLAYER_SPR_WORDS+1)*2*PLAYER_SPR_H*DISPLAY_BITPLANES] of byte chipmem;
+	enemy_sprite  : array[(ENEMY_SPR_WORDS+1)*2*ENEMY_SPR_H*DISPLAY_BITPLANES] of byte chipmem;
 	// Mask for the enemy's real (non-rectangular) shape -- see
 	// player_mask's comment above, same technique.
-	enemy_mask : array[ENEMY_SPR_WORDS*2*(ENEMY_SPR_H+1)] of byte chipmem;
-	attack_sprite : array[ATTACK_SPR_WORDS*2*(ATTACK_SPR_H+1)*3] of byte chipmem;
+	enemy_mask : array[(ENEMY_SPR_WORDS+1)*2*ENEMY_SPR_H*DISPLAY_BITPLANES] of byte chipmem;
+	attack_sprite : array[(ATTACK_SPR_WORDS+1)*2*ATTACK_SPR_H*DISPLAY_BITPLANES] of byte chipmem;
 	// Mask for the attack box -- see player_mask's comment above, same
 	// technique, different (unshared) shape/size from player/enemy.
-	attack_mask : array[ATTACK_SPR_WORDS*2*(ATTACK_SPR_H+1)] of byte chipmem;
+	// PRE-REWRITE: the attack box (and player) aren't wired into the live
+	// main loop yet (DrawPlayer is commented out) -- this buffer's NEW
+	// sizing is ready for when that happens, but hasn't been exercised.
+	attack_mask : array[(ATTACK_SPR_WORDS+1)*2*ATTACK_SPR_H*DISPLAY_BITPLANES] of byte chipmem;
+
+	// ------------------------------------------------------------------
+	// PRE-SHIFTED sprite/mask buffers, used when SPRITE_MODE=1 (see its
+	// own declaration comment for the why and the measured cost model).
+	//
+	// The point: every buffer above carries ONE extra lookahead word per
+	// plane-chunk purely so the hardware barrel shifter has real bits to
+	// shift in for the chunk's final output word, which forces every blit
+	// to be (*_SPR_WORDS+1) words wide even though the drawn box is only
+	// *_SPR_WORDS words wide. Storing NUM_SHIFTS copies of the mask, each
+	// already drawn at its own sub-word pixel offset, removes the shifter
+	// from the per-frame path entirely -- no ASH, no BSH, no lookahead
+	// word -- so the blit narrows from *_SPR_WORDS+1 to *_SPR_WORDS. For
+	// the 32px entities that is 4 words -> 3, i.e. 25% off BOTH the masked
+	// draw and the pristine restore.
+	//
+	// *_SPR_WORDS is ALREADY exactly the right pre-shifted width and needs
+	// no change: it was sized as ceil((box_w + 15)/16), which is precisely
+	// what is needed to hold the box at any sub-word offset 0..15 (32px ->
+	// 47 bits -> 3 words; 43px -> 58 bits -> 4 words). Only the "+1" goes
+	// away. There is deliberately no hidden padding row either -- nothing
+	// borrows across any boundary once the shifter is out of the picture.
+	//
+	// Layout: NUM_SHIFTS variants back to back, each variant being
+	// *_SPR_WORDS*2 bytes per plane-chunk x DISPLAY_BITPLANES chunks per
+	// row x *_SPR_H rows. Variant k holds the box drawn starting at bit k.
+	player_mask_ps : array[NUM_SHIFTS*PLAYER_SPR_WORDS*2*PLAYER_SPR_H*DISPLAY_BITPLANES] of byte chipmem;
+	enemy_mask_ps  : array[NUM_SHIFTS*ENEMY_SPR_WORDS*2*ENEMY_SPR_H*DISPLAY_BITPLANES] of byte chipmem;
+	attack_mask_ps : array[NUM_SHIFTS*ATTACK_SPR_WORDS*2*ATTACK_SPR_H*DISPLAY_BITPLANES] of byte chipmem;
+
+	// The COLOR buffers need only ONE variant, not NUM_SHIFTS -- and this
+	// is a real, load-bearing assumption, not an oversight. BuildSprite
+	// fills each plane-chunk uniformly ($00 or $FF, one value for the
+	// whole chunk), and a uniform chunk is shift-invariant: reading it at
+	// any offset gives the same bits. Nothing shifts data ACROSS a chunk
+	// boundary here either, since channel B is read straight through with
+	// modulo 0 and the per-plane chunk values never move relative to each
+	// other. Saves ~55KB of chip RAM at today's sizes.
+	// *** THIS BREAKS THE MOMENT REAL PIXEL ART REPLACES THE SOLID-FILL
+	// PLACEHOLDER *** (see "Next steps" in CLAUDE.md -- non-uniform
+	// per-pixel color data is NOT shift-invariant). At that point these
+	// three need the same NUM_SHIFTS* multiplier the masks above have, and
+	// BlitStampMaskedPS needs to offset its B pointer by the variant the
+	// same way it already offsets A.
+	player_sprite_ps : array[PLAYER_SPR_WORDS*2*PLAYER_SPR_H*DISPLAY_BITPLANES] of byte chipmem;
+	enemy_sprite_ps  : array[ENEMY_SPR_WORDS*2*ENEMY_SPR_H*DISPLAY_BITPLANES] of byte chipmem;
+	attack_sprite_ps : array[ATTACK_SPR_WORDS*2*ATTACK_SPR_H*DISPLAY_BITPLANES] of byte chipmem;
 
 	// Wide enemy (see WIDE_ENEMY_BOX_W's declaration comment): no sprite/
 	// color buffer needed at all, unlike every other entity -- the
 	// technique draws by unconditionally CLEARING one bitplane's bit
 	// wherever the mask is opaque (see BlitStampMasked1Plane), not by
 	// copying color data from a buffer, so there's no per-pixel color to
-	// store. Only a mask (same BuildBoxMask technique as everything else).
+	// store. Only a mask (same BuildBoxMask procedure as everything else).
+	// PRE-REWRITE SIZE, NOW STALE/UNSAFE, NOT JUST UNPORTED: BuildBoxMask
+	// itself is a single SHARED procedure and HAS been rewritten for the
+	// interleaved layout (see its own comment) -- it now needs
+	// (mwbytes+2)*mhgt*DISPLAY_BITPLANES bytes, not mwbytes*(mhgt+1). This
+	// buffer is still sized the OLD way and its Main-block BuildBoxMask
+	// call is commented out specifically because calling the REWRITTEN
+	// BuildBoxMask against this OLD-sized buffer would overflow it (for
+	// WIDE_ENEMY_SPR_WORDS=7/SPR_H=64: old size 910 bytes vs. the ~3072+
+	// bytes the rewritten procedure would actually write, more once
+	// DISPLAY_BITPLANES>NUM_PLANES). Resize this to (WIDE_ENEMY_SPR_WORDS+1)
+	// *2*WIDE_ENEMY_SPR_H*DISPLAY_BITPLANES (dropping the "+1" on SPR_H,
+	// matching player_mask/enemy_mask/attack_mask's own new formula)
+	// before ever uncommenting that call. Also note: BlitStampMasked1Plane
+	// itself (the wide enemy's own single-plane blit) has NOT been
+	// widened for DISPLAY_BITPLANES padding the way BlitStampMasked has --
+	// it would need the same mwhgt*NUM_PLANES-to-DISPLAY_BITPLANES height
+	// treatment before this could safely coexist with DISPLAY_BITPLANES>3.
 	wide_enemy_mask : array[WIDE_ENEMY_SPR_WORDS*2*(WIDE_ENEMY_SPR_H+1)] of byte chipmem;
 
 	// NOW ACTIVE by default: a single, permanent, whole-screen "pristine"
@@ -417,14 +885,14 @@ var
 	// correct for ANY position, there's nothing left to "save" every
 	// frame at all. This eliminates an entire per-frame phase (Save/
 	// blue), not just speeds up a slow one.
-	// Real screen-shaped, not tightly packed like the old *_bg buffers
-	// below: same 40-byte-row-pitch, 3-plane layout as #screen itself
-	// (see PLANE_SIZE's own comment), so RestoreFromPristine can read a
-	// sub-rectangle out of it using the exact same row-modulo technique
-	// BlitSave already uses to read a sub-rectangle out of the real
-	// screen. Only 3 planes (not 5) -- background only ever uses colors
-	// 1-4, within the same budget documented at BuildSprite.
-	bg_pristine : array[PLANE_SIZE*3] of byte chipmem;
+	// Real screen-shaped -- REWRITTEN for the interleaved-bitplane layout:
+	// bg_pristine is now BYTE-FOR-BYTE identically shaped to #screen
+	// itself (same ROW_STRIDE*256 layout, see NUM_PLANES/ROW_STRIDE's own
+	// comment), not the old separate-PLANE_SIZE-blocks shape. This is what
+	// lets the one-time capture (CaptureBgPristine, see its own comment)
+	// be a single flat whole-buffer blit instead of a per-plane loop, and
+	// what lets RestoreFromPristine use the SAME modulo on both sides.
+	bg_pristine : array[ROW_STRIDE*256] of byte chipmem;
 
 	// ------------------------------------------------------------------
 	// NOT USED by default -- kept for reference, same pattern as
@@ -448,9 +916,14 @@ var
 	// RestoreEntitiesFromSavedBg/RestoreWideEnemyFromSavedBg below.
 	// ------------------------------------------------------------------
 	player_bg : array[(PLAYER_SPR_WORDS+1)*2*PLAYER_SPR_H*3] of byte chipmem;
-	// Leading "6*" is slot CAPACITY (matching ex/ey/e_dir's declared
-	// 6-slot array size), unrelated to the trailing "*3" plane count.
-	enemy_bg  : array[6*(ENEMY_SPR_WORDS+1)*2*ENEMY_SPR_H*3] of byte chipmem;
+	// Leading "16*" is slot CAPACITY (matching ex/ey/e_dir's declared
+	// 16-slot array size, raised from 6 alongside NUM_ENEMIES's own
+	// capacity increase -- see its declaration comment), unrelated to the
+	// trailing "*3" plane count. Kept in sync deliberately: this is the
+	// exact same class of silent-undersizing bug already found and fixed
+	// once before when this leading multiplier was still tied to
+	// NUM_ENEMIES's old *value* instead of the array's real capacity.
+	enemy_bg  : array[16*(ENEMY_SPR_WORDS+1)*2*ENEMY_SPR_H*3] of byte chipmem;
 	attack_bg : array[(ATTACK_SPR_WORDS+1)*2*ATTACK_SPR_H*3] of byte chipmem;
 	// No trailing "*3": only 1 plane is ever touched, so only 1 plane's
 	// worth of background ever needed saving. Leading "16*" is slot
@@ -629,9 +1102,27 @@ begin
 end;
 
 // Fast full-width band clear/fill, used once at startup for the sky and
-// floor bands. Each plane is its own contiguous block (see PLANE_SIZE
-// note above), so filling rows by0..by0+bh-1 within one plane is just a
-// flat run of (bh*40) bytes -- walked 4 bytes (1 longword) at a time.
+// floor bands. REWRITTEN for the interleaved-bitplane layout: a plane's
+// row is no longer part of one long contiguous run across all bh rows --
+// between two rows of the SAME plane now sit the OTHER planes' bytes for
+// the row in between (see NUM_PLANES/ROW_STRIDE's own comment). So
+// instead of one flat longword loop spanning (bh*40) bytes per plane (a
+// handful of loops, each covering many rows of ONE plane), this loops
+// per ROW, and within each row loops per PLANE -- now DISPLAY_BITPLANES
+// planes, not just NUM_PLANES, so the "extra" planes beyond our own
+// 3-plane color budget get explicitly zeroed too (see DISPLAY_BITPLANES's
+// own comment for why: those planes are real, valid, allocated memory now
+// -- ROW_STRIDE accounts for them -- so leaving them uninitialized would
+// risk stray garbage bits, same class of risk the old EHB setup's
+// full-buffer clear was for). `((bcolor>>fpl)&1)` naturally evaluates to
+// 0 for fpl>=3 (bcolor only ever has meaningful bits 0-2), so the SAME
+// per-plane fill logic already correctly zeroes the padding planes
+// without any extra special-casing.
+// A single reusable `fillval`, recomputed once per (row,plane) iteration,
+// replaces the old fillval0/fillval1/fillval2 -- deliberately avoiding a
+// separate named variable per plane (which would have needed hardcoding
+// a fixed max plane count) or an array (the neg-literal asm trick below
+// needs a fixed, named label to move.l into, not a runtime-indexed one).
 procedure FastFillBand(by0,bh,bcolor : integer);
 // fillval must be "long" (32-bit), not "integer" (16-bit) -- a 16-bit
 // var can't hold $FFFFFFFF at all. Even as a "long", neither the literal
@@ -639,71 +1130,60 @@ procedure FastFillBand(by0,bh,bcolor : integer);
 // a read FROM address $FFFFFFFF) nor -1 (compiled to "move.w #$ff,d0" --
 // zero-extended as if it were a byte, giving $000000FF instead of
 // $FFFFFFFF) produces the right bit pattern through TRSE's own constant
-// assignment. Each "set" branch below uses raw asm instead, with the
-// standard "moveq #-1,d0" 68000 idiom, directly at the call site
-// (avoiding a nested procedure declaration, which TRSE may not support).
-var longcount, li : integer; fillval : long; lpa : pointer of long;
+// assignment. The "set" branch below uses raw asm instead, with the
+// standard "moveq #-1,d0" 68000 idiom.
+var frow, fli, ffpl, frowoff : integer; fillval : long; lpa : pointer of long;
 begin
-	longcount := (bh*40) >> 2;
-
-	if ((bcolor&1)=1) then begin
-		asm("
-			moveq #-1,d0
-			move.l d0,fillval
-		");
-	end else fillval:=0;
-	lpa := #screen + by0*40;
-	for li:=0 to longcount do begin lpa[0]:=fillval; lpa:=lpa+4; end;
-
-	if (((bcolor>>1)&1)=1) then begin
-		asm("
-			moveq #-1,d0
-			move.l d0,fillval
-		");
-	end else fillval:=0;
-	lpa := #screen + PLANE_SIZE + by0*40;
-	for li:=0 to longcount do begin lpa[0]:=fillval; lpa:=lpa+4; end;
-
-	if (((bcolor>>2)&1)=1) then begin
-		asm("
-			moveq #-1,d0
-			move.l d0,fillval
-		");
-	end else fillval:=0;
-	lpa := #screen + PLANE_SIZE*2 + by0*40;
-	for li:=0 to longcount do begin lpa[0]:=fillval; lpa:=lpa+4; end;
-
-	if (((bcolor>>3)&1)=1) then begin
-		asm("
-			moveq #-1,d0
-			move.l d0,fillval
-		");
-	end else fillval:=0;
-	lpa := #screen + PLANE_SIZE*3 + by0*40;
-	for li:=0 to longcount do begin lpa[0]:=fillval; lpa:=lpa+4; end;
-
-	if (((bcolor>>4)&1)=1) then begin
-		asm("
-			moveq #-1,d0
-			move.l d0,fillval
-		");
-	end else fillval:=0;
-	lpa := #screen + PLANE_SIZE*4 + by0*40;
-	for li:=0 to longcount do begin lpa[0]:=fillval; lpa:=lpa+4; end;
-
-	// 6th plane (index 5) -- added for EHB support (see the "Main" setup
-	// block's EHB comment). Only ever called with bcolor's bit 5 clear in
-	// practice (background colors are all small values), so this always
-	// clears plane 5 to 0 in normal use -- exactly what's wanted, since
-	// plane 5 is the shadow flag and should start empty.
-	if (((bcolor>>5)&1)=1) then begin
-		asm("
-			moveq #-1,d0
-			move.l d0,fillval
-		");
-	end else fillval:=0;
-	lpa := #screen + PLANE_SIZE*5 + by0*40;
-	for li:=0 to longcount do begin lpa[0]:=fillval; lpa:=lpa+4; end;
+	// NEW GOTCHA, found while diagnosing the interleaved rewrite's missing
+	// sky/floor colors (confirmed via the compiled main.asm, not guessed) --
+	// TWICE, in two different shapes, both now understood:
+	//
+	// Round 1: an earlier version of this loop used "#screen +
+	// frow*ROW_STRIDE + 40*0/1/2" (the plane index hardcoded per unrolled
+	// block). The FINAL term (e.g. "40*0") folds to a compile-time literal,
+	// and the compiler re-fetched the accumulated address with a plain
+	// "move.w" (not move.l) before adding that literal, discarding the
+	// upper 16 bits. Looked like "term order relative to a literal" was
+	// the rule. Fixed by making the plane index a runtime loop variable
+	// (ffpl) instead, giving "#screen + 40*ffpl + frow*ROW_STRIDE" --
+	// no literal anywhere -- which seemed to fix it.
+	//
+	// Round 2: that "fix" was ALSO broken (confirmed via main.asm on a
+	// DISPLAY_BITPLANES=4 rebuild), revealing the real rule: it was never
+	// about literals at all. EVERY proven-safe multi-term pointer
+	// expression elsewhere in this file (SetPixel's "#screen +
+	// PLANE_SIZE*N + rowoff", BlitFillRect's "#screen + fpl*40 + foff",
+	// BlitStampMasked's "#screen + mdst_by*ROW_STRIDE + mdst_bx") has
+	// EXACTLY ONE inline multiplication, with the LAST term a plain,
+	// already-fully-computed variable (no multiplication of its own).
+	// "#screen + 40*ffpl + frow*ROW_STRIDE" has TWO inline multiplications
+	// chained by addition -- confirmed via main.asm that this compiles the
+	// first (#screen + 40*ffpl) into a register via a correct 32-bit
+	// add.l, then narrows it to 16 bits with a plain "move.w" before
+	// computing and adding the second multiplication (frow*ROW_STRIDE).
+	// The compiler can apparently only carry one pending 32-bit
+	// accumulator through this pattern safely; a second inline
+	// multiplication forces a reload that loses the top word regardless of
+	// whether either term is a literal.
+	// FIX: precompute frow*ROW_STRIDE into a plain variable (frowoff)
+	// BEFORE the pointer expression -- once per ROW, not per (row,plane)
+	// pair, which is also strictly less work -- leaving the pointer
+	// expression with exactly one inline multiplication (40*ffpl) and a
+	// plain variable (frowoff) last, matching the proven-safe shape
+	// exactly.
+	for frow:=by0 to by0+bh do begin
+		frowoff := frow*ROW_STRIDE;
+		for ffpl:=0 to DISPLAY_BITPLANES do begin
+			if (((bcolor>>ffpl)&1)=1) then begin
+				asm("
+					moveq #-1,d0
+					move.l d0,fillval
+				");
+			end else fillval:=0;
+			lpa := #screen + 40*ffpl + frowoff;
+			for fli:=0 to 10 do begin lpa[0]:=fillval; lpa:=lpa+4; end;
+		end;
+	end;
 end;
 
 
@@ -713,9 +1193,18 @@ end;
 
 // Fills a solid-color rectangle using the blitter. Much faster than the
 // per-pixel CPU loop (FilledRectSlow), since each bitplane gets one blitter
-// operation rather than (width * height * 6) SetPixel calls.
-// Loops over bitplanes 0-5: for each plane, sets or clears it depending on
-// whether that bit is set in fcolor. Width/height can be arbitrary.
+// operation rather than (width * height * NUM_PLANES) SetPixel calls.
+// Loops over bitplanes 0..NUM_PLANES-1: for each plane, sets or clears it
+// depending on whether that bit is set in fcolor. Width/height can be
+// arbitrary. REWRITTEN for the interleaved-bitplane layout: addressing and
+// the row modulo now account for the OTHER planes' bytes sitting between
+// two rows of the same plane (see NUM_PLANES/ROW_STRIDE's own comment).
+// Still one blitter operation PER PLANE, not a single combined one -- each
+// plane can need a genuinely different fill value (set vs clear), and a
+// single blitter operation can't vary its minterm mid-blit -- but that's
+// fine here: background fill is a ONE-TIME startup cost, not per-frame, so
+// the "fewer, bigger blits" optimization that matters for entities doesn't
+// apply to this procedure.
 procedure BlitFillRect(fx, fy, fw, fh, fcolor : integer);
 var fpl, fbytewidth, fwordwidth, fsize, foff, fdmod : integer; fdst : pointer of byte;
     fcon0 : integer;
@@ -727,12 +1216,21 @@ begin
 	// BLTSIZE format: height << 6 | width_in_words
 	fsize := (fh << 6) | fwordwidth;
 	// Byte offset into screen memory (fx >> 3 = byte column)
-	foff := fy*40 + (fx >> 3);
-	// Row modulo: screen is 40 bytes wide, skip to next row after writing fbytewidth bytes
-	fdmod := 40 - fbytewidth;
+	foff := fy*ROW_STRIDE + (fx >> 3);
+	// Row modulo: skip the OTHER planes' bytes for this row, plus the
+	// rest of this plane's own 40-byte span, to land on the same fx
+	// column of the SAME plane on the next row -- ROW_STRIDE (not 40) now
+	// separates two rows of one plane, since the other planes' data for
+	// this row sits in between.
+	fdmod := ROW_STRIDE - fbytewidth;
 
-	// Loop over bitplanes 0-5
-	for fpl:=0 to 5 do begin
+	// Loop over bitplanes 0..DISPLAY_BITPLANES-1 (not just NUM_PLANES-1):
+	// planes beyond our own 3-plane color budget are real, valid,
+	// allocated memory now (ROW_STRIDE accounts for them) and need
+	// explicit clearing too -- "(fcolor >> fpl) & 1" already naturally
+	// evaluates to 0 for fpl>=3 (fcolor only ever has meaningful bits
+	// 0-2), so this falls out correctly with no other change needed.
+	for fpl:=0 to DISPLAY_BITPLANES do begin
 		// Check if this bitplane is set in fcolor
 		// Use minterms $FF (always 1) or $00 (always 0) - no source channel needed
 		if (((fcolor >> fpl) & 1) = 1) then begin
@@ -741,7 +1239,7 @@ begin
 			fcon0 := $0100;  // USED only, minterm $00 (all 0s)
 		end;
 
-		fdst := #screen + PLANE_SIZE*fpl + foff;
+		fdst := #screen + fpl*40 + foff;
 
 		asm("
 			lea $dff000,a6
@@ -993,30 +1491,42 @@ begin
 	end;
 end;
 
-// Fills a sprite buffer with a solid color pattern: for each plane,
-// wbytes*hgt bytes of either $FF (that color bit set) or $00 (clear),
-// laid out as 3 consecutive tightly-packed per-plane blocks (no padding
-// between rows or between planes) -- matching what BlitStamp expects.
-// Only 3 planes (not 5): background (colors 1-4) and all three entities
-// (player=5, enemy=7, attack=6) fit within a 3-bit color budget (0-7), so
-// bitplanes 3 and 4 are never set by anything on screen -- entity blits
-// skip them entirely (see BlitStamp/BlitStampMasked/BlitSave) rather
-// than wastefully reading/writing planes that are always zero. Adding
-// any color >=8 anywhere breaks this assumption and needs those loops
-// widened back to 5.
+// Fills a sprite (color/B-channel) buffer with a solid color pattern.
+// REWRITTEN for the interleaved-bitplane layout and the single-blit
+// entity draw (see BlitStampMasked's own rewrite comment for the full
+// mechanism this feeds): instead of NUM_PLANES separate contiguous
+// whole-sprite blocks (one flat run of wbytes*hgt bytes per plane), this
+// now writes hgt REAL rows, and for each row, DISPLAY_BITPLANES separate
+// (wbytes+2)-byte chunks back to back (one per plane, real AND padding --
+// see DISPLAY_BITPLANES's own comment) -- wbytes of real fill value, plus
+// 1 extra WORD (2 bytes) of the SAME fill value as a genuine (not
+// borrowed) barrel-shift lookahead slot. No hidden padding ROW anymore --
+// hgt is now the TRUE row count, not row count+1 -- since every chunk
+// already carries its own lookahead word, nothing needs to borrow from a
+// "next" row/plane the way the old true-planar version did (borrowing
+// across a PLANE boundary here would be actively wrong: two different
+// planes can have different fill values -- see BlitStampMasked's
+// comment).
+// Colors fit a 3-bit budget (0-7) across NUM_PLANES=3 real planes;
+// "(bscolor>>bp)&1" naturally evaluates to 0 for bp>=3, so the padding
+// planes (bp from NUM_PLANES up to DISPLAY_BITPLANES-1) automatically get
+// filled with 0 through this SAME loop, no extra special-casing needed
+// (matches BlitFillRect's identical trick for the background).
 procedure BuildSprite(spr : pointer of byte; wbytes, hgt, bscolor : byte);
-var bp, bk, bcount : integer; 
+var bp, bk, brow, bcount : integer;
 	// BUG: bval is a 16-bit word, not a byte
 	bval : byte; // Works
 	//bval : integer; // Should work but doesn't
 
 begin
-	bcount := wbytes*hgt;
-	for bp:=0 to 3 do begin
-		if (((bscolor>>bp)&1)=1) then bval:=255 else bval:=0;
-		for bk:=0 to bcount do begin
-			spr[0] := bval;
-			spr := spr+1;
+	bcount := wbytes+2; // real content + 1 lookahead word, per plane per row
+	for brow:=0 to hgt do begin
+		for bp:=0 to DISPLAY_BITPLANES do begin
+			if (((bscolor>>bp)&1)=1) then bval:=255 else bval:=0;
+			for bk:=0 to bcount do begin
+				spr[0] := bval;
+				spr := spr+1;
+			end;
 		end;
 	end;
 end;
@@ -1045,36 +1555,64 @@ end;*/
 // (mwbytes wide) is deliberately wider than the real mboxw content --
 // word-rounding slop plus the extra word reserved for the barrel shift's
 // lookahead (see PLAYER_SPR_WORDS/ENEMY_SPR_WORDS/ATTACK_SPR_WORDS's
-// declaration comments). BLTAMOD=-2 (see BlitStampMasked) rewinds the
-// source to re-fetch lookahead data from further AHEAD in the buffer,
-// meaning the shift delays/pushes content RIGHTWARD as shift_result
-// rises from 0 to 15 -- so all the slack margin belongs on the LEFT, and
-// the real box sits flush against the buffer's right edge (mwbytes*8,
-// the NOMINAL width passed in here -- not the wider +1-word lookahead
-// margin BlitStampMasked reserves internally).
+// declaration comments). Empirically confirmed (pre-rewrite, still true):
+// the shift delays/pushes content RIGHTWARD as shift_result rises from 0
+// to 15 -- so all the slack margin belongs on the LEFT, and the real box
+// sits flush against the buffer's right edge (mwbytes*8, the NOMINAL
+// width passed in here -- not the wider +1-word lookahead margin
+// BlitStampMasked reserves internally). NOTE: the ORIGINAL reasoning tied
+// this to a specific BLTAMOD=-2 rewind trick in BlitStampMasked -- that
+// trick is GONE post-rewrite (BlitStampMasked now uses AMOD=0, see its
+// own comment for why), but the empirical shift direction itself doesn't
+// depend on that mechanism and still holds.
+// REWRITTEN for the interleaved-bitplane layout (see BuildSprite's own
+// rewrite comment for the matching reasoning on the color/B-channel
+// side). The mask is logically a SINGLE bitplane's worth of shape data,
+// but since the destination screen buffer now walks DISPLAY_BITPLANES
+// chunks per real row in ONE blitter operation (see BlitStampMasked's
+// rewrite -- including the DISPLAY_BITPLANES-vs-NUM_PLANES padding-plane
+// generalization), the mask data has to physically REPEAT once per
+// plane-chunk of the WHOLE row (mrowbytes uses DISPLAY_BITPLANES), not
+// just per real color plane. There's no cheaper way to make one channel
+// re-read the same data once per plane without a modulo that varies
+// mid-blit, which the hardware doesn't support (a channel's modulo is one
+// fixed value for the whole operation). The content-drawing loop itself
+// still only writes the REAL outline into the first NUM_PLANES chunks
+// (mpl:=0 to NUM_PLANES) -- the padding chunks (NUM_PLANES..
+// DISPLAY_BITPLANES-1) are left at 0 by the zero-init loop above, which
+// is exactly what's wanted: mask=0 there makes BlitStampMasked's masked
+// blit a no-op for those sub-rows (D=C, "leave background as-is"), so
+// they never corrupt or need real content. Costs DISPLAY_BITPLANES times
+// the mask memory instead of 1x -- trivial in absolute terms for buffers
+// this small. No hidden padding ROW anymore either, same reasoning as
+// BuildSprite: every chunk already carries its own genuine (not borrowed)
+// lookahead word, so mhgt is the TRUE row count now, not row count+1.
 procedure BuildBoxMask(mspr : pointer of byte; mwbytes, mhgt, mboxw : integer);
-var mrow, mbit, mboxleft, mreal_h, mbyteoff, mzi : integer; mval : byte; mrp : pointer of byte;
+var mrow, mbit, mboxleft, mbyteoff, mzi, mchunk, mrowbytes, mpl : integer; mval : byte; mrp : pointer of byte;
 begin
+	mchunk := mwbytes+2;
+	mrowbytes := mchunk*DISPLAY_BITPLANES;
 	mrp := mspr;
-	for mzi:=0 to mhgt*mwbytes do begin
+	for mzi:=0 to mhgt*mrowbytes do begin
 		mrp[0] := 0;
 		mrp := mrp+1;
 	end;
 
 	mboxleft := mwbytes*8 - mboxw;
-	mreal_h := mhgt-1; // last row is the hidden shift-lookahead padding row
 
-	for mrow:=0 to mreal_h do begin
+	for mrow:=0 to mhgt do begin
 		for mbit:=0 to mboxw do begin
 			mval := 0;
 			if (mrow=0) then mval:=1;
-			if (mrow=mreal_h-1) then mval:=1;
+			if (mrow=mhgt-1) then mval:=1;
 			if (mbit=0) then mval:=1;
 			if (mbit=mboxw-1) then mval:=1;
 			if (mval=1) then begin
-				mbyteoff := mrow*mwbytes + ((mboxleft+mbit)>>3);
-				mrp := mspr + mbyteoff;
-				mrp[0] := mrp[0] | bittable[(mboxleft+mbit)&7];
+				for mpl:=0 to NUM_PLANES do begin
+					mbyteoff := mrow*mrowbytes + mpl*mchunk + ((mboxleft+mbit)>>3);
+					mrp := mspr + mbyteoff;
+					mrp[0] := mrp[0] | bittable[(mboxleft+mbit)&7];
+				end;
 			end;
 		end;
 	end;
@@ -1095,28 +1633,45 @@ end;
 // EnemyAttackHits use their own hardcoded pixel offsets, not *_BOX_W, so
 // this is purely cosmetic and never affects gameplay); only an inner ring
 // is added as a decoration.
+// REWRITTEN for the interleaved-bitplane layout -- same DISPLAY_BITPLANES-
+// wide-layout/NUM_PLANES-real-content split as BuildBoxMask above (same
+// mask buffer, same mchunk/mrowbytes-shaped layout, called AFTER
+// BuildBoxMask on it), and same ihgt-is-now-the-true-row-count
+// substitution (no more ireal_h).
 procedure BuildBoxMaskInset(ispr : pointer of byte; iwbytes, ihgt, iboxw, iinset : integer);
-var irow, ibit, iboxleft, ireal_h, ibyteoff, iw : integer; ival : byte; irp : pointer of byte;
+var irow, ibit, iboxleft, ibyteoff, iw, ichunk, irowbytes, ipl : integer; ival : byte; irp : pointer of byte;
 begin
+	ichunk := iwbytes+2;
+	irowbytes := ichunk*DISPLAY_BITPLANES;
 	iboxleft := iwbytes*8 - iboxw;
-	ireal_h := ihgt-1;
 	iw := iboxw - iinset*2;
-	for irow:=iinset to ireal_h-iinset do begin
+	for irow:=iinset to ihgt-iinset do begin
 		for ibit:=0 to iw do begin
 			ival := 0;
 			if (irow=iinset) then ival:=1;
-			if (irow=ireal_h-iinset-1) then ival:=1;
+			if (irow=ihgt-iinset-1) then ival:=1;
 			if (ibit=0) then ival:=1;
 			if (ibit=iw-1) then ival:=1;
 			if (ival=1) then begin
-				ibyteoff := irow*iwbytes + ((iboxleft+iinset+ibit)>>3);
-				irp := ispr + ibyteoff;
-				irp[0] := irp[0] | bittable[(iboxleft+iinset+ibit)&7];
+				for ipl:=0 to NUM_PLANES do begin
+					ibyteoff := irow*irowbytes + ipl*ichunk + ((iboxleft+iinset+ibit)>>3);
+					irp := ispr + ibyteoff;
+					irp[0] := irp[0] | bittable[(iboxleft+iinset+ibit)&7];
+				end;
 			end;
 		end;
 	end;
 end;
 
+// PRE-REWRITE / NOT interleaved-aware -- see NUM_PLANES's own comment.
+// Still true-planar (PLANE_SIZE-per-plane addressing), still loops per
+// plane. Its only LIVE caller right now is RestoreFromPristine's own
+// pre-rewrite sibling concept -- actually unused: none of BlitStamp's
+// current callers (DrawPlayerBuiltinBlit, the old SaveEntityBackgrounds-
+// based restore path) run in the live main loop. Kept as-is; would need
+// the same one-shot-multi-plane treatment as BlitStampMasked below before
+// any of its callers can be safely revived against the new #screen.
+//
 // Blits a pre-built sprite onto the screen at (dst_bx,dst_by) -- dst_bx
 // is a WORD-aligned byte column (from ClampWordCol), dst_by a plain row.
 // One blitter operation per plane: channel A (source) straight to
@@ -1141,6 +1696,117 @@ end;
 // hardcoded "for bpln:=0 to 3" exactly) so the wide-enemy test entity's
 // 1-plane restore can reuse this instead of a near-duplicate procedure --
 // see WIDE_ENEMY_BOX_W's declaration comment.
+// PRE-SHIFTED sibling of BuildSprite (SPRITE_MODE=1). Only difference:
+// the per-plane chunk is pswbytes, not pswbytes+2 -- no lookahead word,
+// since nothing barrel-shifts this data any more. Builds ONE variant, not
+// NUM_SHIFTS: see player_sprite_ps's declaration comment for why a
+// uniform solid-fill chunk is shift-invariant, and for what has to change
+// when real pixel art lands.
+// Parameter names are all "ps"-prefixed and distinct from BuildSprite's
+// own -- TRSE does not scope parameter names per procedure (gotcha #1).
+procedure BuildSpritePS(psspr : pointer of byte; pswbytes, pshgt, pscolor : byte);
+var pspl, psk, psrow : integer;
+	psval : byte;
+begin
+	for psrow:=0 to pshgt do begin
+		for pspl:=0 to DISPLAY_BITPLANES do begin
+			if (((pscolor>>pspl)&1)=1) then psval:=255 else psval:=0;
+			for psk:=0 to pswbytes do begin
+				psspr[0] := psval;
+				psspr := psspr+1;
+			end;
+		end;
+	end;
+end;
+
+// PRE-SHIFTED sibling of BuildBoxMask (SPRITE_MODE=1). Builds ALL
+// NUM_SHIFTS variants in one call, walking a running pointer from variant
+// to variant rather than having the caller compute each variant's base
+// address -- deliberate: "base + index*size" is a two-term pointer
+// expression containing a multiplication, a shape gotcha #8 has broken in
+// this codebase before and which has never been proven safe, whereas
+// "ptr := ptr + plain_variable" is the exact increment BuildSprite already
+// uses successfully.
+//
+// Two differences from BuildBoxMask beyond that: the per-plane chunk is
+// qmwbytes (no +2 lookahead word), and the box's left edge sits at bit
+// qmshift instead of being flush RIGHT against the nominal width. That
+// flush-right placement was an empirical requirement of the barrel
+// shifter (content had to sit against the right edge with the slack on
+// the left, see CLAUDE.md); with no shifter involved, variant k simply
+// draws the box starting at bit k, and qmwbytes*8 is wide enough to hold
+// box_w + 15 bits by construction.
+procedure BuildBoxMaskPS(qmspr : pointer of byte; qmwbytes, qmhgt, qmboxw : integer);
+var qmrow, qmbit, qmbyteoff, qmzi, qmrowbytes, qmpl, qmshift, qmvarbytes : integer;
+var qmval : byte; qmrp : pointer of byte;
+begin
+	qmrowbytes := qmwbytes*DISPLAY_BITPLANES;
+	qmvarbytes := qmhgt*qmrowbytes;
+
+	for qmshift:=0 to NUM_SHIFTS do begin
+		qmrp := qmspr;
+		for qmzi:=0 to qmvarbytes do begin
+			qmrp[0] := 0;
+			qmrp := qmrp+1;
+		end;
+
+		for qmrow:=0 to qmhgt do begin
+			for qmbit:=0 to qmboxw do begin
+				qmval := 0;
+				if (qmrow=0) then qmval:=1;
+				if (qmrow=qmhgt-1) then qmval:=1;
+				if (qmbit=0) then qmval:=1;
+				if (qmbit=qmboxw-1) then qmval:=1;
+				if (qmval=1) then begin
+					for qmpl:=0 to NUM_PLANES do begin
+						qmbyteoff := qmrow*qmrowbytes + qmpl*qmwbytes + ((qmshift+qmbit)>>3);
+						qmrp := qmspr + qmbyteoff;
+						qmrp[0] := qmrp[0] | bittable[(qmshift+qmbit)&7];
+					end;
+				end;
+			end;
+		end;
+
+		qmspr := qmspr + qmvarbytes;
+	end;
+end;
+
+// PRE-SHIFTED sibling of BuildBoxMaskInset -- adds the enemy's second,
+// inset ring on top of an already-built BuildBoxMaskPS buffer, to ALL
+// NUM_SHIFTS variants. Same "walk a running pointer" structure and same
+// no-lookahead / draw-at-bit-qishift placement as BuildBoxMaskPS above.
+// Does NOT clear first (same as the original), so order matters: outer
+// border via BuildBoxMaskPS, then this.
+procedure BuildBoxMaskInsetPS(qispr : pointer of byte; qiwbytes, qihgt, qiboxw, qiinset : integer);
+var qirow, qibit, qibyteoff, qirowbytes, qipl, qishift, qivarbytes, qiw : integer;
+var qival : byte; qirp : pointer of byte;
+begin
+	qirowbytes := qiwbytes*DISPLAY_BITPLANES;
+	qivarbytes := qihgt*qirowbytes;
+	qiw := qiboxw - qiinset*2;
+
+	for qishift:=0 to NUM_SHIFTS do begin
+		for qirow:=qiinset to qihgt-qiinset do begin
+			for qibit:=0 to qiw do begin
+				qival := 0;
+				if (qirow=qiinset) then qival:=1;
+				if (qirow=qihgt-qiinset-1) then qival:=1;
+				if (qibit=0) then qival:=1;
+				if (qibit=qiw-1) then qival:=1;
+				if (qival=1) then begin
+					for qipl:=0 to NUM_PLANES do begin
+						qibyteoff := qirow*qirowbytes + qipl*qiwbytes + ((qishift+qiinset+qibit)>>3);
+						qirp := qispr + qibyteoff;
+						qirp[0] := qirp[0] | bittable[(qishift+qiinset+qibit)&7];
+					end;
+				end;
+			end;
+		end;
+
+		qispr := qispr + qivarbytes;
+	end;
+end;
+
 procedure BlitStamp(dst_bx, dst_by, wwords, whgt, dshift, nplanes : integer; wspr : pointer of byte);
 var bpln, bmod, bsize, boff, bcon0, beffw, bamod : integer; bsrc, bdst : pointer of byte;
 begin
@@ -1209,95 +1875,282 @@ end;
 
 // Masked blit: real (non-rectangular) sprite drawing, combined with the
 // barrel shifter for true per-pixel x-positioning. Uses all four
-// blitter channels per plane -- A = mask (single bitplane, same mask
-// reused for every one of the color planes below), B = this plane's
-// own color data, C = destination readback (so the blitter can see what
-// is already on screen), D = destination write. Minterm $CA implements
-// D = (A AND B) OR (NOT A AND C): where the mask is opaque (1), take the
-// sprite's own color bit; where it's transparent (0), keep whatever
-// background was already there -- the standard Amiga "cookie cutter"
-// masked-sprite technique. ASH (in mcon0) shifts A and B together, so
-// mask and image stay pixel-aligned as they move -- same beffw/AMOD
-// rewind trick as BlitStamp, applied to both shifted channels. Both
-// enemy_mask and enemy_sprite carry a hidden padding row for the same
-// reason (see their declaration comments): a shifted last row's
-// lookahead needs somewhere safe, same-buffer to land. Loops over 3
-// planes, not 5 -- see BuildSprite's comment: the whole screen's color
-// budget fits in 3 bits, so planes 3-4 are always zero and never need
-// touching (not even a background-preserving read on channel C).
+// blitter channels -- A = mask, B = color data, C = destination readback
+// (so the blitter can see what is already on screen), D = destination
+// write. Minterm $CA implements D = (A AND B) OR (NOT A AND C): where the
+// mask is opaque (1), take the sprite's own color bit; where it's
+// transparent (0), keep whatever background was already there -- the
+// standard Amiga "cookie cutter" masked-sprite technique. ASH (in mcon0)
+// and BSH (in mcon1) shift A and B together, so mask and image stay
+// pixel-aligned as they move.
+//
+// REWRITTEN for the interleaved-bitplane layout: this used to loop 3
+// times (once per plane), each iteration a full BLTSIZE-triggered
+// blitter operation with its own BBUSY wait and register reload. Now
+// it's ONE blitter operation for the WHOLE multi-plane entity -- this is
+// the actual point of the interleaved rewrite (see CLAUDE.md's "Next
+// steps": the wide-enemy test proved fewer/bigger blits buy real
+// headroom; this generalizes that win to the real entities, not just the
+// experimental test one).
+//
+// Mechanism: BLTSIZE's height field now counts mwhgt*DISPLAY_BITPLANES
+// "sub-rows" -- NOT mwhgt*NUM_PLANES -- each sub-row is exactly one
+// plane's worth of one real row (mbeffw words wide, the same "+1
+// lookahead word" margin as before). Walking forward by mcdmod bytes
+// after every sub-row on the C/D (screen) side ALWAYS lands on the same
+// destination column, whether the next sub-row is the next plane of the
+// SAME real row or plane 0 of the NEXT real row -- both are just "skip to
+// the start of the next 40-byte block" hops in this layout, since planes
+// are stored back-to-back per row with no gaps (see NUM_PLANES/
+// ROW_STRIDE's own comments). That symmetry is what makes a single fixed
+// modulo correct across the whole multi-plane, multi-row operation, with
+// the SAME mcdmod formula (40 - mbeffw*2) this procedure already used
+// per-plane before the rewrite -- BUT it only holds if the blit walks
+// through EVERY block the real row actually contains, including
+// DISPLAY_BITPLANES's "extra" padding planes beyond our own NUM_PLANES
+// color budget; stopping at NUM_PLANES sub-rows per row would jump
+// straight into the middle of the padding planes instead of the next
+// row's plane 0 the moment DISPLAY_BITPLANES > NUM_PLANES. The mask (A)
+// channel being 0 for those padding sub-rows (see BuildBoxMask's own
+// rewrite comment) is what makes walking through them harmless: D=(A AND
+// B) OR (NOT A AND C) with A=0 reduces to D=C, a no-op that leaves
+// whatever's already in that (always-zero, never-drawn-to) padding plane
+// untouched.
+//
+// The mask (A) and sprite (B) source buffers are built to match this
+// same per-sub-row cadence directly (see BuildSprite/BuildBoxMask's own
+// rewrite comments) -- both are walked with modulo 0 (tightly packed),
+// no AMOD/BMOD rewind trick needed at all anymore: every sub-row already
+// carries its own genuine lookahead word (not borrowed from a neighbour,
+// which would be WRONG here since neighbouring sub-rows can be different
+// PLANES with different fill values -- unlike the old true-planar
+// version, where "the next row" always meant the next row of the SAME
+// plane, making the borrow safe). There's no more "true last row" special
+// case either, since nothing borrows across a boundary in the first
+// place -- the mdshift=0 flashing bug this procedure's history is built
+// around (see the git history / CLAUDE.md for the full original
+// writeup) doesn't have anywhere to hide in this design: there is no
+// narrow/wide shortcut branch left to skip by mistake.
 procedure BlitStampMasked(mdst_bx, mdst_by, mwwords, mwhgt, mdshift : integer; wmask, mwspr : pointer of byte);
-var mpln, mcdmod, msize, moff, mcon0, mcon1, mbeffw, mabmod : integer;
+var mcdmod, msize, mcon0, mcon1, mbeffw : integer;
 var masrc, mbsrc, mcdst, mddst : pointer of byte;
 begin
-	// FOUND: unlike BlitStamp (plain 2-channel copy, where this same
-	// mdshift=0 special case is provably safe -- used constantly by
-	// Restore/Save with no issue), skipping the lookahead word/rewind at
-	// exactly mdshift=0 is the actual root cause of the masked+shifted
-	// flashing bug for this 4-channel cookie-cut blit. Diagnosed by
-	// testing ClampWordCol's clamp with shift_result forced to different
-	// literal values: 8 and 15 (both take the "mdshift<>0" branch below)
-	// were clean; 0 (the ONLY value that takes the now-removed "mdshift=0"
-	// branch above) glitched; 16 -- which overflows BLTCON0's 4-bit ASH
-	// field and lands on the exact same real hardware shift as 0, but
-	// (being literally "16", not "0") takes the "mdshift<>0" branch below
-	// -- was ALSO clean. Every clean case took the wider/rewind path;
-	// the one glitching case was the only one that took the narrower
-	// shortcut. So the shortcut itself, not the shift value, is the bug.
-	// Fix: always take what used to be the "else" branch, unconditionally.
 	mbeffw := mwwords+1;
-	asm("
-		moveq #-2,d0
-		move.w d0,mabmod
-	");
 	mcdmod := 40 - mbeffw*2;
-	msize := (mwhgt<<6) | mbeffw;
-	moff := mdst_by*40 + mdst_bx;
+	msize := ((mwhgt*DISPLAY_BITPLANES)<<6) | mbeffw;
 	mcon0 := ((mdshift << 8) << 4) | $0FCA;
-	// BLTCON1 was hardcoded to $0 here -- meaning channel B (the color
-	// data) was NEVER actually shifted, regardless of mdshift. BLTCON0's
-	// ASH (bits 15-12) shifts channel A only; channel B has its own,
-	// separate shift field, BSH, in BLTCON1's bits 15-12 -- setting only
-	// BLTCON0 leaves B stuck word-aligned while A moves to the true
-	// sub-pixel position. Currently invisible in practice (BuildSprite
-	// fills each color plane uniformly, so any read position within a
-	// plane's buffer gives the same value regardless of shift), but a
-	// real correctness bug that would matter the moment non-uniform
-	// (real pixel-art) sprite data is used. Same bits-15-12 placement
-	// technique as mcon0, no minterm bits needed (BLTCON1's low byte
-	// controls line-mode/fill-mode features we don't use, so 0 there is
-	// correct).
+	// BSH (channel B's own shift field, BLTCON1 bits 15-12) -- see the
+	// original flashing-bug investigation (CLAUDE.md) for why this must
+	// be set alongside ASH, not left at $0.
 	mcon1 := (mdshift << 8) << 4;
 	masrc := wmask;
 	mbsrc := mwspr;
-	for mpln:=0 to 3 do begin
-		mcdst := #screen + PLANE_SIZE*mpln + moff;
-		mddst := mcdst;
+	// NOT "#screen + (mdst_by*ROW_STRIDE + mdst_bx)" via a precomputed
+	// combined offset var -- that's a 2-term pointer expression (base +
+	// one bare variable) with NOTHING else, the exact shape CLAUDE.md
+	// gotcha #8 already flags as unsafe (confirmed to silently truncate
+	// #screen's real address to 16 bits in this very rewrite -- see
+	// FastFillBand's own fix comment for the freshly-diagnosed sibling
+	// bug and the compiled-assembly evidence). Keeping the multiply and
+	// the plain variable as two SEPARATE terms here, with the plain
+	// variable last, matches the proven-safe 3-term shape used
+	// everywhere else in this file (e.g. SetPixel's
+	// "#screen + PLANE_SIZE*N + rowoff").
+	mcdst := #screen + mdst_by*ROW_STRIDE + mdst_bx;
+	mddst := mcdst;
+	asm("
+		lea $dff000,a6
+		move.l masrc,a0
+		move.l mbsrc,a1
+		move.l mcdst,a2
+		move.l mddst,a3
+	MaskBlitWait:
+		btst #14,$dff002
+		bne.s MaskBlitWait
+		move.l #$ffffffff,BLTAFWM(a6)
+		move.w mcon0,BLTCON0(a6)
+		move.w mcon1,BLTCON1(a6)
+		move.w #$0,BLTAMOD(a6)
+		move.w #$0,BLTBMOD(a6)
+		move.w mcdmod,BLTCMOD(a6)
+		move.w mcdmod,BLTDMOD(a6)
+		move.l a0,BLTAPTH(a6)
+		move.l a1,BLTBPTH(a6)
+		move.l a2,BLTCPTH(a6)
+		move.l a3,BLTDPTH(a6)
+		move.w msize,BLTSIZE(a6)
+	");
+end;
+
+// PRE-SHIFTED entity draw, selected via SPRITE_MODE=1 (see its own
+// declaration comment). Same cookie-cutter minterm ($CA: D = (A AND B) OR
+// (NOT A AND C)) and the same single-blit-spans-all-planes mechanism as
+// BlitStampMasked -- the ONLY differences are that the barrel shifter is
+// not used at all, and the source width loses its lookahead word:
+//   - BLTCON0 carries no ASH, BLTCON1 no BSH (both shift fields zero).
+//   - The blit is psswwords words wide, not psswwords+1. That narrowing
+//     is the entire point: it is 25% less data through all four channels
+//     for the 32px entities.
+//   - Channel A points at variant pssshift of the pre-shifted mask
+//     instead of at a single buffer the shifter then moves.
+//   - A/B modulos stay 0 (tightly packed) and C/D keep the same
+//     (40 - width) per-plane-chunk modulo, so the "one fixed modulo walks
+//     both plane and row boundaries" trick is untouched -- see
+//     BlitStampMasked's own comment for why that works.
+// Channel B does NOT get a per-variant offset: the color buffers have one
+// variant only, which is valid exactly while their chunks are uniform
+// solid fills -- see player_sprite_ps's declaration comment for the
+// caveat when real pixel art arrives.
+//
+// The A-pointer arithmetic (base + shift*variant_size) is done in asm
+// rather than as a TRSE pointer expression on purpose: that is a two-term
+// expression containing a multiplication, which gotcha #8's history in
+// this file gives no reason to trust. mulu.w is exact here -- pssshift is
+// 0..15 and pssvarsz is a few thousand at most, so the 32-bit product
+// cannot overflow.
+// Parameter names are "pss"-prefixed and distinct from every other blit
+// procedure's (gotcha #1 -- TRSE does not scope parameter names, and
+// reusing BlitStampMasked's names is a hard build failure, not a subtle
+// bug).
+procedure BlitStampMaskedPS(pssdst_bx, pssdst_by, psswwords, psswhgt, pssshift : integer; psswmask, psswspr : pointer of byte);
+var psscdmod, psssize, pssvarsz : integer;
+var pssbsrc, psscdst, pssddst : pointer of byte;
+begin
+	psscdmod := 40 - psswwords*2;
+	psssize := ((psswhgt*DISPLAY_BITPLANES)<<6) | psswwords;
+	pssvarsz := psswwords*2*psswhgt*DISPLAY_BITPLANES;
+	pssbsrc := psswspr;
+	// Same proven-safe 3-term shape (one inline multiplication, plain
+	// variable last) as BlitStampMasked's own destination pointer -- see
+	// its comment and gotcha #8's Refinement #2.
+	psscdst := #screen + pssdst_by*ROW_STRIDE + pssdst_bx;
+	pssddst := psscdst;
+	asm("
+		lea $dff000,a6
+		move.l psswmask,a0
+		moveq #0,d0
+		move.w pssshift,d0
+		mulu pssvarsz,d0
+		add.l d0,a0
+		move.l pssbsrc,a1
+		move.l psscdst,a2
+		move.l pssddst,a3
+	MaskBlitPSWait:
+		btst #14,$dff002
+		bne.s MaskBlitPSWait
+		move.l #$ffffffff,BLTAFWM(a6)
+		move.w #$0fca,BLTCON0(a6)
+		move.w #$0,BLTCON1(a6)
+		move.w #$0,BLTAMOD(a6)
+		move.w #$0,BLTBMOD(a6)
+		move.w psscdmod,BLTCMOD(a6)
+		move.w psscdmod,BLTDMOD(a6)
+		move.l a0,BLTAPTH(a6)
+		move.l a1,BLTBPTH(a6)
+		move.l a2,BLTCPTH(a6)
+		move.l a3,BLTDPTH(a6)
+		move.w psssize,BLTSIZE(a6)
+	");
+end;
+
+// ALTERNATE entity draw, selected via ENTITY_BLIT_MODE (see its own
+// declaration comment) instead of BlitStampMasked above when
+// DISPLAY_BITPLANES > NUM_PLANES is actually wanted for real (more total
+// on-screen colors, not just a quick DMA-cost benchmark): BlitStampMasked
+// is fast BUT pays for walking DISPLAY_BITPLANES sub-rows per real row,
+// including the always-empty padding ones (needed to keep its single
+// fixed modulo valid across both plane and row boundaries -- see its own
+// comment). This procedure instead does NUM_PLANES SEPARATE blitter
+// operations, one per REAL plane, each spanning all mwhgt rows with its
+// OWN modulo (ROW_STRIDE - mbeffw*2) that skips straight from one row's
+// plane p to the NEXT row's SAME plane p, jumping over however many other
+// planes (real or padding) sit in between in a single hop -- indifferent
+// to DISPLAY_BITPLANES's value, since ROW_STRIDE already accounts for it.
+// This is structurally the SAME technique BlitStamp/the old true-planar
+// BlitStampMasked always used, just with ROW_STRIDE-relative addressing
+// instead of PLANE_SIZE-relative. Reads the SAME mask/sprite buffers as
+// BlitStampMasked (no separate buffers needed): both were already laid
+// out with DISPLAY_BITPLANES chunks per row (see BuildSprite/BuildBoxMask),
+// so picking out just plane mpl's chunk from each row and skipping the
+// rest is exactly what this procedure's own AMOD/BMOD (mrowbytes-mchunk)
+// does. Costs NUM_PLANES separate BBUSY-wait+register-set+trigger
+// sequences per entity (matching this project's ORIGINAL pre-single-blit
+// cost) -- slower than BlitStampMasked at DISPLAY_BITPLANES=NUM_PLANES,
+// which is exactly why it's not the default; but its total blitter data
+// moved per entity is INDEPENDENT of DISPLAY_BITPLANES, unlike
+// BlitStampMasked's, so it's the one to reach for once DISPLAY_BITPLANES
+// is being raised for real extra on-screen colors rather than as a
+// temporary DMA-cost probe.
+// NOTE: parameters are all "pp"-prefixed and distinct from BlitStampMasked's
+// own (mdst_bx/mdst_by/etc.) -- TRSE does not scope parameter names per
+// procedure (same class of issue as gotcha #1: everything is effectively
+// global), so reusing BlitStampMasked's exact parameter names here failed
+// the build outright ("Variable 'mdst_bx' is already defined!"), not just
+// a style choice.
+procedure BlitStampMaskedPerPlane(ppdst_bx, ppdst_by, ppwwords, ppwhgt, ppdshift : integer; ppwmask, ppwspr : pointer of byte);
+var ppabmod, ppcdmod, ppsize, pprowoff, ppcon0, ppcon1, ppbeffw, ppchunk, pprowbytes, ppl : integer;
+var ppasrc, ppbsrc, ppcdst, ppddst : pointer of byte;
+begin
+	ppbeffw := ppwwords+1;
+	ppchunk := ppbeffw*2;
+	pprowbytes := ppchunk*DISPLAY_BITPLANES;
+	// A/B (mask/sprite) modulo: skip the OTHER DISPLAY_BITPLANES-1 chunks
+	// in this row to land on the SAME plane's chunk in the next row --
+	// same "whole row stride minus this chunk's own width" shape as the
+	// C/D modulo below, just measured against the mask/sprite buffer's
+	// own row width (pprowbytes) instead of the real screen's (ROW_STRIDE).
+	ppabmod := pprowbytes - ppchunk;
+	ppcdmod := ROW_STRIDE - ppchunk;
+	ppsize := (ppwhgt<<6) | ppbeffw;
+	ppcon0 := ((ppdshift << 8) << 4) | $0FCA;
+	ppcon1 := (ppdshift << 8) << 4;
+	// Precomputed once, reused per plane below -- see BlitStampMasked's
+	// own comment for why this can't just be inlined as a 3rd term
+	// alongside "ppl*40" (two inline multiplications in one pointer
+	// expression is the exact shape CLAUDE.md gotcha #8 confirms unsafe).
+	pprowoff := ppdst_by*ROW_STRIDE + ppdst_bx;
+	for ppl:=0 to NUM_PLANES do begin
+		// "ppwmask + ppl*ppchunk" -- a 2-term expression, base plus ONE
+		// inline multiplication, nothing else -- matches the proven-safe
+		// 2-term "BASE + mult" shape (e.g. CaptureBgPristine's
+		// "#screen + 40*cppl").
+		ppasrc := ppwmask + ppl*ppchunk;
+		ppbsrc := ppwspr + ppl*ppchunk;
+		ppcdst := #screen + ppl*40 + pprowoff;
+		ppddst := ppcdst;
 		asm("
 			lea $dff000,a6
-			move.l masrc,a0
-			move.l mbsrc,a1
-			move.l mcdst,a2
-			move.l mddst,a3
-		MaskBlitWait:
+			move.l ppasrc,a0
+			move.l ppbsrc,a1
+			move.l ppcdst,a2
+			move.l ppddst,a3
+		MaskBlitPPWait:
 			btst #14,$dff002
-			bne.s MaskBlitWait
+			bne.s MaskBlitPPWait
 			move.l #$ffffffff,BLTAFWM(a6)
-			move.w mcon0,BLTCON0(a6)
-			move.w mcon1,BLTCON1(a6)
-			move.w mabmod,BLTAMOD(a6)
-			move.w mabmod,BLTBMOD(a6)
-			move.w mcdmod,BLTCMOD(a6)
-			move.w mcdmod,BLTDMOD(a6)
+			move.w ppcon0,BLTCON0(a6)
+			move.w ppcon1,BLTCON1(a6)
+			move.w ppabmod,BLTAMOD(a6)
+			move.w ppabmod,BLTBMOD(a6)
+			move.w ppcdmod,BLTCMOD(a6)
+			move.w ppcdmod,BLTDMOD(a6)
 			move.l a0,BLTAPTH(a6)
 			move.l a1,BLTBPTH(a6)
 			move.l a2,BLTCPTH(a6)
 			move.l a3,BLTDPTH(a6)
-			move.w msize,BLTSIZE(a6)
+			move.w ppsize,BLTSIZE(a6)
 		");
-		mbsrc := mbsrc + mwwords*2*(mwhgt+1);
 	end;
 end;
 
+// PRE-REWRITE / NOT interleaved-aware -- see NUM_PLANES's own comment.
+// The wide-enemy test entity (and BlitStampMasked1Plane below) is
+// deferred until "other objects in turn" per the interleaved rewrite
+// plan; still addresses plane 0 via PLANE_SIZE*0, which happens to still
+// equal 0 numerically either way, but its whole design (1 plane touched
+// out of NUM_PLANES) doesn't carry over to the new layout as-is and isn't
+// called from the live main loop right now regardless.
+//
 // EXPERIMENTAL, single-plane counterpart to BlitStampMasked -- see
 // WIDE_ENEMY_BOX_W's declaration comment for the "fewer, bigger blits"
 // test this exists for. Only 3 blitter channels, not 4: A = mask, C =
@@ -1363,6 +2216,14 @@ begin
 	");
 end;
 
+// PRE-REWRITE / NOT interleaved-aware -- see NUM_PLANES's own comment.
+// Still true-planar (PLANE_SIZE-per-plane addressing), still loops per
+// plane. Not called live right now -- its only callers are the dormant
+// SaveEntityBackgrounds()/SaveWideEnemy() reference path -- but Main's
+// setup block DOES still need a one-time whole-screen capture into
+// bg_pristine; that's now CaptureBgPristine() further down (a fresh,
+// interleaved-native procedure) rather than a call to this one.
+//
 // Mirror image of BlitStamp: copies FROM the screen at (src_bx,src_by)
 // INTO a buffer, instead of buffer-to-screen. Same per-plane blitter
 // loop, with the modulo roles swapped -- channel A (now the screen) has
@@ -1402,42 +2263,152 @@ begin
 end;
 
 // Restores a rectangle directly from bg_pristine to the screen -- both
-// sides are "screen-shaped" (real 40-byte-wide rows), unlike BlitStamp
-// (source tightly packed) or BlitSave (destination tightly packed), so
-// BOTH channels need the SAME row-skip modulo here. This is what lets
-// SaveEntityBackgrounds/SaveWideEnemy not need to run every frame by
-// default: bg_pristine is always correct for any position, so there's
-// nothing to snapshot each frame -- RestoreEntities/RestoreWideEnemy
-// just pull straight from it using the entity's OLD position, same as
-// they always have. (The old per-frame-snapshot versions are kept
-// further down for reference -- see player_bg's declaration comment for
-// why they're still worth having around.) Always
-// shift=0 (restoring wants back exactly the true background, no
-// repositioning), so no beffw/BLTAMOD-rewind branching is needed at all.
+// sides are "screen-shaped" (real ROW_STRIDE-wide rows), so BOTH channels
+// need the SAME modulo here. This is what lets SaveEntityBackgrounds/
+// SaveWideEnemy not need to run every frame by default: bg_pristine is
+// always correct for any position, so there's nothing to snapshot each
+// frame -- RestoreEntities/RestoreWideEnemy just pull straight from it
+// using the entity's OLD position, same as they always have. (The old
+// per-frame-snapshot versions are kept further down for reference -- see
+// player_bg's declaration comment for why they're still worth having
+// around.) Always shift=0 (restoring wants back exactly the true
+// background, no repositioning), so no beffw/BLTAMOD-rewind branching is
+// needed at all.
+//
+// REWRITTEN for the interleaved-bitplane layout -- same "one blit instead
+// of nplanes" mechanism as BlitStampMasked's own rewrite (see its comment
+// for the full reasoning), but simpler here since restoring is a plain
+// 2-channel "D=A" copy (no mask/shift), and both sides (screen and
+// bg_pristine) share the IDENTICAL interleaved layout, so both use the
+// SAME modulo. Call sites now pass nplanes=DISPLAY_BITPLANES (not a
+// hardcoded 3) -- same DISPLAY_BITPLANES-vs-NUM_PLANES padding-plane
+// reasoning as BlitStampMasked: restore must walk through every plane the
+// masked draw's single blit did, real or padding, for the row-vs-plane
+// modulo symmetry to hold. nplanes is now a height MULTIPLIER instead of
+// a loop bound, but the parameter's job (how many plane-chunks per real
+// row) means exactly the same thing either way.
 procedure RestoreFromPristine(dst_bx, dst_by, wwords, whgt, nplanes : integer);
-var prpln, prmod, prsize, proff : integer; prsrc, prdst : pointer of byte;
+var prmod, prsize : integer; prsrc, prdst : pointer of byte;
 begin
 	prmod := 40 - wwords*2;
-	prsize := (whgt<<6) | wwords;
-	proff := dst_by*40 + dst_bx;
-	for prpln:=0 to nplanes do begin
-		prsrc := #bg_pristine + PLANE_SIZE*prpln + proff;
-		prdst := #screen + PLANE_SIZE*prpln + proff;
+	prsize := ((whgt*nplanes)<<6) | wwords;
+	// NOT a precomputed combined offset added as a single bare variable --
+	// see BlitStampMasked's own comment (same fix, same reasoning): that
+	// 2-term "base + one variable" shape is the exact one CLAUDE.md
+	// gotcha #8 already flags, and is confirmed (via FastFillBand's
+	// sibling bug, found while diagnosing this rewrite's missing sky/
+	// floor colors) to silently truncate a chipmem base address to 16
+	// bits. Keeping the multiply and the plain variable as separate
+	// terms, plain variable last, matches every proven-safe pointer
+	// expression elsewhere in this file.
+	prsrc := #bg_pristine + dst_by*ROW_STRIDE + dst_bx;
+	prdst := #screen + dst_by*ROW_STRIDE + dst_bx;
+	asm("
+		lea $dff000,a6
+		move.l prsrc,a0
+		move.l prdst,a1
+	RestorePristineWait:
+		btst #14,$dff002
+		bne.s RestorePristineWait
+		move.l #$ffffffff,BLTAFWM(a6)
+		move.w #$09f0,BLTCON0(a6)
+		move.w #$0,BLTCON1(a6)
+		move.w prmod,BLTAMOD(a6)
+		move.w prmod,BLTDMOD(a6)
+		move.l a0,BLTAPTH(a6)
+		move.l a1,BLTDPTH(a6)
+		move.w prsize,BLTSIZE(a6)
+	");
+end;
+
+// ALTERNATE restore, paired with BlitStampMaskedPerPlane above -- selected
+// the same way, via ENTITY_BLIT_MODE. Same reasoning as that procedure:
+// NUM_PLANES separate 2-channel copies (one per REAL plane), each using
+// modulo (ROW_STRIDE - wwords*2) to skip straight to the next row of the
+// SAME plane, indifferent to how many padding planes DISPLAY_BITPLANES
+// adds in between. No "nplanes" parameter needed (unlike
+// RestoreFromPristine) since it's always exactly NUM_PLANES separate
+// operations here, never DISPLAY_BITPLANES-many.
+// NOTE: parameters are "rpp"-prefixed, distinct from RestoreFromPristine's
+// own (dst_bx/dst_by/wwords/whgt) -- see BlitStampMaskedPerPlane's own
+// comment: TRSE doesn't scope parameter names per procedure, so reusing
+// those exact names here fails the build the same way theirs did.
+procedure RestoreFromPristinePerPlane(rppdst_bx, rppdst_by, rppwwords, rppwhgt : integer);
+var rppmod, rppsize, rprowoff, rppl : integer; rppsrc, rppdst : pointer of byte;
+begin
+	rppmod := ROW_STRIDE - rppwwords*2;
+	rppsize := (rppwhgt<<6) | rppwwords;
+	rprowoff := rppdst_by*ROW_STRIDE + rppdst_bx;
+	for rppl:=0 to NUM_PLANES do begin
+		rppsrc := #bg_pristine + rppl*40 + rprowoff;
+		rppdst := #screen + rppl*40 + rprowoff;
 		asm("
 			lea $dff000,a6
-			move.l prsrc,a0
-			move.l prdst,a1
-		RestorePristineWait:
+			move.l rppsrc,a0
+			move.l rppdst,a1
+		RestorePristinePPWait:
 			btst #14,$dff002
-			bne.s RestorePristineWait
+			bne.s RestorePristinePPWait
 			move.l #$ffffffff,BLTAFWM(a6)
 			move.w #$09f0,BLTCON0(a6)
 			move.w #$0,BLTCON1(a6)
-			move.w prmod,BLTAMOD(a6)
-			move.w prmod,BLTDMOD(a6)
+			move.w rppmod,BLTAMOD(a6)
+			move.w rppmod,BLTDMOD(a6)
 			move.l a0,BLTAPTH(a6)
 			move.l a1,BLTDPTH(a6)
-			move.w prsize,BLTSIZE(a6)
+			move.w rppsize,BLTSIZE(a6)
+		");
+	end;
+end;
+
+// One-time whole-screen capture into bg_pristine -- see its own
+// declaration comment. Replaces the old "BlitSave(0, 0, 20, 256, 3,
+// #bg_pristine)" call in Main.
+//
+// REVISED for DISPLAY_BITPLANES support: an earlier version of this
+// procedure treated bg_pristine and #screen as one giant flat blob (both
+// BYTE-FOR-BYTE identically shaped, so a "whole buffer in one BLTSIZE
+// call" copy seemed like a natural simplification) -- width = ROW_STRIDE/2
+// words, height = 256. That's only safe while ROW_STRIDE/2 <= 63
+// (BLTSIZE's width field is 6 bits): true for NUM_PLANES=3
+// (ROW_STRIDE=120, 60 words, fits), but DISPLAY_BITPLANES=4 already gives
+// ROW_STRIDE=160 (80 words) -- silently overflowing the width field the
+// moment this knob is used for its actual purpose. Fixed by going back to
+// a per-PLANE loop instead (one 40-byte/20-word-wide copy per plane,
+// height=256 each) -- always safe regardless of DISPLAY_BITPLANES (20
+// words and 256 rows are both comfortably within BLTSIZE's limits), at
+// the cost of DISPLAY_BITPLANES separate blitter operations instead of
+// one. That's fine: this is a ONE-TIME STARTUP cost, not per-frame, so
+// losing the "single blit" cleverness here doesn't affect the
+// per-frame-cost measurement DISPLAY_BITPLANES testing actually cares
+// about.
+procedure CaptureBgPristine();
+var cppl, cpmod, cpsize : integer; cpsrc, cpdst : pointer of byte;
+begin
+	cpmod := ROW_STRIDE - 40;
+	cpsize := (256<<6) | 20;   // 20 words = 40 bytes = one plane's row width
+	for cppl:=0 to DISPLAY_BITPLANES do begin
+		// "#screen + 40*cppl" (2 terms, last term a runtime multiplication,
+		// not a bare variable or a foldable literal) matches the safe
+		// shape confirmed by the ORIGINAL pre-rewrite FastFillBand's own
+		// "#screen + by0*40" -- see CLAUDE.md gotcha #8's updated writeup.
+		cpsrc := #screen + 40*cppl;
+		cpdst := #bg_pristine + 40*cppl;
+		asm("
+			lea $dff000,a6
+			move.l cpsrc,a0
+			move.l cpdst,a1
+		CaptureBgPristineWait:
+			btst #14,$dff002
+			bne.s CaptureBgPristineWait
+			move.l #$ffffffff,BLTAFWM(a6)
+			move.w #$09f0,BLTCON0(a6)
+			move.w #$0,BLTCON1(a6)
+			move.w cpmod,BLTAMOD(a6)
+			move.w cpmod,BLTDMOD(a6)
+			move.l a0,BLTAPTH(a6)
+			move.l a1,BLTDPTH(a6)
+			move.w cpsize,BLTSIZE(a6)
 		");
 	end;
 end;
@@ -1538,6 +2509,15 @@ begin
 	// planes 0-4. Gated on EHB_ENABLED: pointless (and if EHB is off,
 	// BPL6PTH doesn't even matter to the display) to spend a per-frame
 	// register poke on this when the shadow plane isn't in use at all.
+	//
+	// PRE-REWRITE / DEFERRED, commented out along with the rest of EHB
+	// during the interleaved-bitplane rewrite (see Main's setup block
+	// comment) -- ehb_bpl5's PLANE_SIZE*5 offset no longer exists as
+	// valid memory within the new, smaller #screen buffer (NUM_PLANES=3
+	// planes, not 6), so this must stay disabled even if EHB_ENABLED is
+	// flipped back on by mistake, until EHB itself is redesigned for the
+	// interleaved layout.
+	/*
 	if (EHB_ENABLED=1) then begin
 		asm("
 			lea $dff000,a6
@@ -1548,6 +2528,7 @@ begin
 			move.w d0,$f6(a6)
 		");
 	end;
+	*/
 end;
 
 // See VBlank/vblank_count's comments above for why this replaces
@@ -1694,6 +2675,93 @@ begin
 end;
 
 
+
+// ========================================================================
+// Blitter Nasty (BLTPRI, DMACON bit 10) -- see NASTY_MODE's declaration
+// comment for the full "what it is, why BLTCON1 bit 1 is the WRONG
+// register, and why it is safe here" writeup.
+// ========================================================================
+
+// Give the blitter absolute bus priority: the CPU now only gets the chip-
+// bus cycles the blitter does not want. Written as a raw immediate rather
+// than through a TRSE variable deliberately -- $8400 is a negative value
+// in 16-bit signed terms, exactly the shape gotcha #7 miscompiles when it
+// goes through constant-assignment codegen.
+procedure BlitterNastyOn();
+begin
+	asm("
+		move.w #$8400,$dff096
+	");
+end;
+
+// Hand the CPU its normal share of the bus back. The BBUSY spin first is
+// deliberate, not decorative: DrawEnemies TRIGGERS its last blit and
+// returns immediately, so clearing BLTPRI right away would drop priority
+// for the tail of a blit that is still running. Costs nothing here --
+// with the whole blit block deferred behind WaitForVisibleEnd the CPU has
+// no other work left this frame, it would simply idle at the top of the
+// loop instead. This cannot hang: a blit always terminates, and BLTPRI
+// does not gate the blitter's own DMA, only who wins the leftover cycles.
+procedure BlitterNastyOff();
+begin
+	asm("
+		NastyOffWait:
+		btst #14,$dff002
+		bne.s NastyOffWait
+		move.w #$0400,$dff096
+	");
+end;
+
+// Mode 1: hand the whole BLTPRI window over to the copper.
+//
+// This writes straight into "copper_custom", the compiler's own static
+// copper list, using the exact code shape TRSE's InitCustomCopperList/
+// AddCopperCommand/EndCustomCopperList intrinsics generate (confirmed by
+// reading the compiled main.asm: "lea copper_custom,a5" followed by pairs
+// of "move.w #x,(a5)+" and a "move.l #$fffffffe,(a5)+" terminator).
+// Hand-written rather than calling those intrinsics for one reason only:
+// they emit their arguments as compile-time immediates, and the WAIT line
+// here needs to come from nasty_on_line so it stays tunable.
+//
+// Position is what makes this work with zero per-frame maintenance:
+// copper_custom sits immediately after the static list's "WAIT line $2c /
+// BPLCON0 := copper_resolution" pair, so the copper arrives here having
+// just reached line 44 -- the first visible line. The list therefore
+// reads, in raster order:
+//     (already at line 44)  DMACON := $0400   clear BLTPRI
+//     WAIT nasty_on_line
+//                           DMACON := $8400   set BLTPRI
+//     end of list
+// The copper restarts from the top of its list at every vertical blank,
+// so BLTPRI stays SET right across the vblank into the next frame and is
+// not cleared again until line 44 -- exactly the window the deferred
+// Restore..Draw block runs in. DMACON is register $096, comfortably above
+// the $080 copper-danger threshold, so no CDANG/COPCON change is needed
+// for the copper to be allowed to write it.
+//
+// This overwrites the three copper instructions the .tru template parked
+// at copper_custom ("$ffdf/$fffe, $2401/$fffe, BPLCON0 := $0200" -- a
+// blank-the-display-at-the-bottom tail whose WAIT for line $24 AFTER the
+// 255-line wrap lands around 292, a line NTSC's ~262-line frame never
+// reaches at all). Nothing is lost under NTSC.
+procedure InstallNastyCopper();
+begin
+	asm("
+		lea copper_custom,a5
+		move.w #$0096,(a5)+
+		move.w #$0400,(a5)+
+		move.w nasty_on_line,d0
+		lsl.w #8,d0
+		or.w #$0001,d0
+		move.w d0,(a5)+
+		move.w #$fffe,(a5)+
+		move.w #$0096,(a5)+
+		move.w #$8400,(a5)+
+		move.l #$fffffffe,(a5)+
+	");
+end;
+
+
 // ========================================================================
 // Player
 // ========================================================================
@@ -1796,12 +2864,33 @@ begin
 	// writes one word wider than wwords, so the right-edge clamp must
 	// reserve room for that too.
 	//waitforblitter();	
-	ClampWordCol(px-16, (PLAYER_SPR_WORDS+1)*2);
-	BlitStampMasked(blk_result, py-jump_height-64, PLAYER_SPR_WORDS, PLAYER_SPR_H, shift_result, #player_mask, #player_sprite);
+	// Per-branch ClampWordCol arguments -- see DrawEnemies' comment for
+	// why the PS branch drops the "-16" (BuildBoxMaskPS has no flush-right
+	// inset) and narrows the clamp width.
+	if (SPRITE_MODE=1) then begin
+		ClampWordCol(px, PLAYER_SPR_WORDS*2);
+		BlitStampMaskedPS(blk_result, py-jump_height-64, PLAYER_SPR_WORDS, PLAYER_SPR_H, shift_result, #player_mask_ps, #player_sprite_ps);
+	end else begin
+		ClampWordCol(px-PLAYER_BOX_LEFT, (PLAYER_SPR_WORDS+1)*2);
+		if (ENTITY_BLIT_MODE=1) then
+			BlitStampMaskedPerPlane(blk_result, py-jump_height-64, PLAYER_SPR_WORDS, PLAYER_SPR_H, shift_result, #player_mask, #player_sprite)
+		else
+			BlitStampMasked(blk_result, py-jump_height-64, PLAYER_SPR_WORDS, PLAYER_SPR_H, shift_result, #player_mask, #player_sprite);
+	end;
 
 	if (atk_active=1) then begin
-		ClampWordCol(atk_x-21, (ATTACK_SPR_WORDS+1)*2);
-		BlitStampMasked(blk_result, atk_y-10, ATTACK_SPR_WORDS, ATTACK_SPR_H, shift_result, #attack_mask, #attack_sprite);
+		// Attack's own flush-right inset is 21px (ATTACK_SPR_WORDS*2*8 -
+		// ATTACK_BOX_W = 64 - 43), which is what the non-PS "-21" cancels.
+		if (SPRITE_MODE=1) then begin
+			ClampWordCol(atk_x, ATTACK_SPR_WORDS*2);
+			BlitStampMaskedPS(blk_result, atk_y-10, ATTACK_SPR_WORDS, ATTACK_SPR_H, shift_result, #attack_mask_ps, #attack_sprite_ps);
+		end else begin
+			ClampWordCol(atk_x-ATTACK_BOX_LEFT, (ATTACK_SPR_WORDS+1)*2);
+			if (ENTITY_BLIT_MODE=1) then
+				BlitStampMaskedPerPlane(blk_result, atk_y-10, ATTACK_SPR_WORDS, ATTACK_SPR_H, shift_result, #attack_mask, #attack_sprite)
+			else
+				BlitStampMasked(blk_result, atk_y-10, ATTACK_SPR_WORDS, ATTACK_SPR_H, shift_result, #attack_mask, #attack_sprite);
+		end;
 	end;
 	//waitforblitter();
 end;
@@ -1849,7 +2938,7 @@ end;
 procedure DrawPlayerBuiltinBlit();
 var abpln, aboff, absize, abmod : integer; absrc, abdst : pointer of byte;
 begin
-	ClampWordCol(px-16, (PLAYER_SPR_WORDS+1)*2);
+	ClampWordCol(px-PLAYER_BOX_LEFT, (PLAYER_SPR_WORDS+1)*2);
 	aboff := (py-jump_height-64)*40 + blk_result;
 	absize := (PLAYER_SPR_H<<6) | PLAYER_SPR_WORDS;
 	abmod := 40 - PLAYER_SPR_WORDS*2;
@@ -2035,8 +3124,33 @@ begin
 			// all three, even though save/restore (shift=0) don't
 			// strictly need the wider margin themselves.
 			// Masked AND shifted: real shape, true per-pixel x-position.
-			ClampWordCol(ex[i]-16, (ENEMY_SPR_WORDS+1)*2);
-			BlitStampMasked(blk_result, ey[i]-64, ENEMY_SPR_WORDS, ENEMY_SPR_H, shift_result, #enemy_mask, #enemy_sprite);
+			// ENTITY_BLIT_MODE picks the technique -- see its own
+			// declaration comment. SPRITE_MODE outranks it -- see
+			// SPRITE_MODE's own comment for why there is no per-plane PS
+			// variant.
+			// NOTE the different ClampWordCol arguments per branch, both
+			// load-bearing:
+			//  - x: BuildBoxMask places the box FLUSH RIGHT within the
+			//    nominal width (mboxleft = mwbytes*8 - mboxw = 16px here),
+			//    an empirical requirement of the barrel shifter, and this
+			//    "-16" is what cancels it back out. BuildBoxMaskPS has no
+			//    such inset -- variant k draws the box starting at bit k
+			//    -- so the PS branch passes the entity's TRUE left pixel.
+			//    Getting this wrong renders the entity 16px left of where
+			//    collision thinks it is, with nothing to flag it.
+			//  - width: the PS blit really is *_SPR_WORDS wide, so its
+			//    right-edge clamp reserves that, not the shifted path's
+			//    extra lookahead word.
+			if (SPRITE_MODE=1) then begin
+				ClampWordCol(ex[i], ENEMY_SPR_WORDS*2);
+				BlitStampMaskedPS(blk_result, ey[i]-64, ENEMY_SPR_WORDS, ENEMY_SPR_H, shift_result, #enemy_mask_ps, #enemy_sprite_ps);
+			end else begin
+				ClampWordCol(ex[i]-ENEMY_BOX_LEFT, (ENEMY_SPR_WORDS+1)*2);
+				if (ENTITY_BLIT_MODE=1) then
+					BlitStampMaskedPerPlane(blk_result, ey[i]-64, ENEMY_SPR_WORDS, ENEMY_SPR_H, shift_result, #enemy_mask, #enemy_sprite)
+				else
+					BlitStampMasked(blk_result, ey[i]-64, ENEMY_SPR_WORDS, ENEMY_SPR_H, shift_result, #enemy_mask, #enemy_sprite);
+			end;
 		end;
 	end;
 end;
@@ -2088,8 +3202,28 @@ begin
 			// where the entity actually sits -- stays consistent across
 			// both, even though restore (shift=0) doesn't strictly need
 			// the wider margin itself.
-			ClampWordCol(ex[i]-16, (ENEMY_SPR_WORDS+1)*2);
-			RestoreFromPristine(blk_result, ey[i]-64, ENEMY_SPR_WORDS+1, ENEMY_SPR_H, 3);
+			// nplanes=DISPLAY_BITPLANES, not a hardcoded 3: restore must walk
+			// through the SAME padding planes the masked draw's single blit
+			// does, for the same row-vs-plane-boundary-modulo reason -- see
+			// RestoreFromPristine/BlitStampMasked's own rewrite comments.
+			// ENTITY_BLIT_MODE picks the technique, same as DrawEnemies.
+			// SPRITE_MODE=1 restores *_SPR_WORDS wide, NOT +1: with the
+			// barrel shifter gone the draw no longer touches that extra
+			// word, so restoring it would be pure waste. This narrowing is
+			// half of pre-shifting's total saving -- see SPRITE_MODE.
+			// ClampWordCol must be given the SAME arguments the matching
+			// draw branch uses, or restore erases at a different word
+			// column than the draw wrote to -- see DrawEnemies' comment.
+			if (SPRITE_MODE=1) then begin
+				ClampWordCol(ex[i], ENEMY_SPR_WORDS*2);
+				RestoreFromPristine(blk_result, ey[i]-64, ENEMY_SPR_WORDS, ENEMY_SPR_H, DISPLAY_BITPLANES);
+			end else begin
+				ClampWordCol(ex[i]-ENEMY_BOX_LEFT, (ENEMY_SPR_WORDS+1)*2);
+				if (ENTITY_BLIT_MODE=1) then
+					RestoreFromPristinePerPlane(blk_result, ey[i]-64, ENEMY_SPR_WORDS+1, ENEMY_SPR_H)
+				else
+					RestoreFromPristine(blk_result, ey[i]-64, ENEMY_SPR_WORDS+1, ENEMY_SPR_H, DISPLAY_BITPLANES);
+			end;
 		end;
 	end;
 
@@ -2098,12 +3232,28 @@ begin
 	// draw step used to place the entity there. Width is *_SPR_WORDS+1
 	// to cover the same widened footprint the masked+shifted draw
 	// touches (see DrawPlayer/DrawEnemies' ClampWordCol comment).
-	ClampWordCol(px-16, (PLAYER_SPR_WORDS+1)*2);
-	RestoreFromPristine(blk_result, py-jump_height-64, PLAYER_SPR_WORDS+1, PLAYER_SPR_H, 3);
+	if (SPRITE_MODE=1) then begin
+		ClampWordCol(px, PLAYER_SPR_WORDS*2);
+		RestoreFromPristine(blk_result, py-jump_height-64, PLAYER_SPR_WORDS, PLAYER_SPR_H, DISPLAY_BITPLANES);
+	end else begin
+		ClampWordCol(px-PLAYER_BOX_LEFT, (PLAYER_SPR_WORDS+1)*2);
+		if (ENTITY_BLIT_MODE=1) then
+			RestoreFromPristinePerPlane(blk_result, py-jump_height-64, PLAYER_SPR_WORDS+1, PLAYER_SPR_H)
+		else
+			RestoreFromPristine(blk_result, py-jump_height-64, PLAYER_SPR_WORDS+1, PLAYER_SPR_H, DISPLAY_BITPLANES);
+	end;
 
 	if (atk_active=1) then begin
-		ClampWordCol(atk_x-21, (ATTACK_SPR_WORDS+1)*2);
-		RestoreFromPristine(blk_result, atk_y-10, ATTACK_SPR_WORDS+1, ATTACK_SPR_H, 3);
+		if (SPRITE_MODE=1) then begin
+			ClampWordCol(atk_x, ATTACK_SPR_WORDS*2);
+			RestoreFromPristine(blk_result, atk_y-10, ATTACK_SPR_WORDS, ATTACK_SPR_H, DISPLAY_BITPLANES);
+		end else begin
+			ClampWordCol(atk_x-ATTACK_BOX_LEFT, (ATTACK_SPR_WORDS+1)*2);
+			if (ENTITY_BLIT_MODE=1) then
+				RestoreFromPristinePerPlane(blk_result, atk_y-10, ATTACK_SPR_WORDS+1, ATTACK_SPR_H)
+			else
+				RestoreFromPristine(blk_result, atk_y-10, ATTACK_SPR_WORDS+1, ATTACK_SPR_H, DISPLAY_BITPLANES);
+		end;
 	end;
 end;
 
@@ -2138,16 +3288,16 @@ procedure RestoreEntitiesFromSavedBg();
 begin
 	for i:=0 to NUM_ENEMIES do begin
 		if (e_alive[i]=1) then begin
-			ClampWordCol(ex[i]-16, (ENEMY_SPR_WORDS+1)*2);
+			ClampWordCol(ex[i]-ENEMY_BOX_LEFT, (ENEMY_SPR_WORDS+1)*2);
 			BlitStamp(blk_result, ey[i]-64, ENEMY_SPR_WORDS+1, ENEMY_SPR_H, 0, 3, #enemy_bg + i*((ENEMY_SPR_WORDS+1)*2*ENEMY_SPR_H*3));
 		end;
 	end;
 
-	ClampWordCol(px-16, (PLAYER_SPR_WORDS+1)*2);
+	ClampWordCol(px-PLAYER_BOX_LEFT, (PLAYER_SPR_WORDS+1)*2);
 	BlitStamp(blk_result, py-jump_height-64, PLAYER_SPR_WORDS+1, PLAYER_SPR_H, 0, 3, #player_bg);
 
 	if (atk_active=1) then begin
-		ClampWordCol(atk_x-21, (ATTACK_SPR_WORDS+1)*2);
+		ClampWordCol(atk_x-ATTACK_BOX_LEFT, (ATTACK_SPR_WORDS+1)*2);
 		BlitStamp(blk_result, atk_y-10, ATTACK_SPR_WORDS+1, ATTACK_SPR_H, 0, 3, #attack_bg);
 	end;
 end;
@@ -2170,16 +3320,16 @@ procedure SaveEntityBackgrounds();
 begin
 	for i:=0 to NUM_ENEMIES do begin
 		if (e_alive[i]=1) then begin
-			ClampWordCol(ex[i]-16, (ENEMY_SPR_WORDS+1)*2);
+			ClampWordCol(ex[i]-ENEMY_BOX_LEFT, (ENEMY_SPR_WORDS+1)*2);
 			BlitSave(blk_result, ey[i]-64, ENEMY_SPR_WORDS+1, ENEMY_SPR_H, 3, #enemy_bg + i*((ENEMY_SPR_WORDS+1)*2*ENEMY_SPR_H*3));
 		end;
 	end;
 
-	ClampWordCol(px-16, (PLAYER_SPR_WORDS+1)*2);
+	ClampWordCol(px-PLAYER_BOX_LEFT, (PLAYER_SPR_WORDS+1)*2);
 	BlitSave(blk_result, py-jump_height-64, PLAYER_SPR_WORDS+1, PLAYER_SPR_H, 3, #player_bg);
 
 	if (atk_active=1) then begin
-		ClampWordCol(atk_x-21, (ATTACK_SPR_WORDS+1)*2);
+		ClampWordCol(atk_x-ATTACK_BOX_LEFT, (ATTACK_SPR_WORDS+1)*2);
 		BlitSave(blk_result, atk_y-10, ATTACK_SPR_WORDS+1, ATTACK_SPR_H, 3, #attack_bg);
 	end;
 end;
@@ -2199,53 +3349,54 @@ end;
 // ========================================================================
 
 begin
-	// EHB (Extra Half-Brite) setup -- now switchable via EHB_ENABLED (see
-	// its own declaration comment). Previously this branch didn't exist
-	// at all: SetupNonInterlacedScreen was always called with 5 and
-	// copper_resolution was unconditionally patched to bpl=6, so trying
-	// to test a different DISPLAY_BITPLANES value (e.g. the original 3)
-	// left the screen forced into 6-plane EHB mode regardless of what
-	// was passed in -- while planes 3-4's pointers were never actually
-	// set up for that case, corrupting the display. This branch is what
-	// fixes that: the two paths are now fully independent.
-	if (EHB_ENABLED=1) then begin
-		// bpl=5 here (not DISPLAY_BITPLANES) is deliberate and NOT a
-		// bug: this is the highest value SetupNonInterlacedScreen's own
-		// .tru implementation has a branch for, and calling it this way
-		// gets BPL1-5PTH/PTL all set up correctly for free. EHB
-		// structurally needs all 5 "real" planes' pointers valid
-		// regardless of how many our own color budget actually uses
-		// (planes 3-4 stay part of the existing budget's deliberately-
-		// untouched territory, just like today), and plane 5 is the new
-		// EHB half-bright flag -- see FastFillBand's own 6th-plane
-		// branch and the full-screen clear below for why they need to
-		// start at a known zero, not whatever garbage happens to be in
-		// chip RAM.
-		Graphics::SetupNonInterlacedScreen(#screen,5);
+	// ------------------------------------------------------------------
+	// Interleaved-bitplane screen setup (see NUM_PLANES/ROW_STRIDE's own
+	// declaration comments for the layout itself). Graphics::
+	// SetupDefaultScreen is TRSE's own built-in for exactly this layout
+	// (confirmed by reading graphics.tru: it advances the copper-list
+	// pointer by 40 bytes -- one ROW -- between planes, not by 40*256 --
+	// one whole PLANE -- the way SetupNonInterlacedScreen does, and sets
+	// copper_mod_even/odd to (bpl-1)*40 so the display hardware's own
+	// per-plane modulo skips the OTHER planes' bytes each row -- exactly
+	// ROW_STRIDE-40, just computed on the .tru side instead of ours).
+	// Passed DISPLAY_BITPLANES here, not NUM_PLANES: this call controls
+	// how many planes the DISPLAY actually fetches (real DMA/copper cost),
+	// which is the whole point of DISPLAY_BITPLANES being a separate,
+	// live-adjustable knob from our own NUM_PLANES=3 color budget -- see
+	// its own declaration comment. This project had never actually tried
+	// SetupDefaultScreen before this rewrite -- CLAUDE.md gotcha #3 flags
+	// it as unreliable "for bpl>2-ish," but that finding was from bpl=5
+	// testing long ago and never root-caused; the first build at bpl=3
+	// worked cleanly, so bpl=4/5 (testable via DISPLAY_BITPLANES) are
+	// still worth watching but not presumed broken. If the screen comes
+	// up corrupted or blank at a given DISPLAY_BITPLANES value, the next
+	// thing to try is hand-rolling the equivalent setup manually
+	// (BPLxPTH/PTL pokes + copper_mod_even/odd pokes) -- the same
+	// BPLxPTH/PTL-poke technique already proven for EHB's plane 5 (see the
+	// commented-out EHB reference block just below, and VBlank()'s own
+	// commented-out per-frame reset) -- rather than trusting this call
+	// further.
+	Graphics::SetupDefaultScreen(#screen, DISPLAY_BITPLANES);
 
-		// SetupNonInterlacedScreen has no branch for bpl=6 (EHB's actual
-		// trigger value) at all -- it silently sets BPLCON0's plane-count
-		// field regardless of which branch fires, but only branches 1-5
-		// ever program the BPLxPTH pointers, so bpl=6 alone would leave
-		// every pointer register at whatever it happened to hold before
-		// (garbage). So: call it with bpl=5 above (real pointer setup,
-		// all 5 "normal" planes), then finish the last two pieces of EHB
-		// setup by hand.
-		//
-		// 1) BPL6PTH/PTL ($dff0f4/$dff0f6 -- standard, fixed Amiga
-		// hardware offsets, not project-specific and so not independently
-		// re-derived from this project's own compiled output the way
-		// BLTCON0 etc. were; this is the well-documented, unchanging
-		// silicon register map). SWAP is the standard 68000 idiom for
-		// splitting a 32-bit address into the two 16-bit halves these
-		// paired pointer registers need. Re-asserted every frame in
-		// VBlank() too (see its own comment) -- this one-time poke just
-		// makes the very first frame correct before the first interrupt
-		// fires.
-		ehb_bpl5 := #screen + PLANE_SIZE*5 + 0; // +0 forces the safe
-		// 3-term pointer-expression codegen path (CLAUDE.md gotcha #8)
-		// rather than the 2-term "#screen + PLANE_SIZE*5" shape that's
-		// proven to truncate under some conditions elsewhere in this file.
+	// PRE-REWRITE, EHB setup -- DEFERRED, not deleted. EHB's whole
+	// mechanism (6 real+shadow planes, all assuming the OLD true-planar
+	// PLANE_SIZE-per-plane layout) needs its own redesign to work with
+	// interleaving -- not attempted in this pass (see CLAUDE.md's "Next
+	// steps"). DO NOT re-enable EHB_ENABLED or call
+	// Graphics::SetupNonInterlacedScreen(#screen, DISPLAY_BITPLANES)
+	// against the new #screen buffer above (ROW_STRIDE*256 =
+	// 40*DISPLAY_BITPLANES*256 bytes -- 30720 at the default
+	// DISPLAY_BITPLANES=3, still only 51200 even at its documented max of
+	// 5) -- either call assumes a PLANE_SIZE-per-plane-spaced buffer of up
+	// to 6*40*256 = 61440 bytes, LARGER than #screen at any
+	// DISPLAY_BITPLANES value this project supports, and would read/write
+	// past the end of the real buffer into whatever chip RAM follows it.
+	// The FillShadowRect call and VBlank()'s per-frame BPL6PTH reset are
+	// commented out for the same reason -- see their own comments.
+	/*
+	if (EHB_ENABLED=1) then begin
+		Graphics::SetupNonInterlacedScreen(#screen,5);
+		ehb_bpl5 := #screen + PLANE_SIZE*5 + 0;
 		asm("
 			lea $dff000,a6
 			move.l ehb_bpl5,d0
@@ -2254,47 +3405,12 @@ begin
 			swap d0
 			move.w d0,$f6(a6)
 		");
-		//
-		// 2) Permanently bump the DISPLAYED bitplane count from 5 to 6 --
-		// this is what actually turns EHB on. Patches copper_resolution's
-		// own STORED value (the same poke16 SetupNonInterlacedScreen
-		// already used internally to set it to 5, moments ago) rather
-		// than poking BPLCON0 directly, because the compiled copper list
-		// re-writes BPLCON0 from copper_resolution's value every single
-		// frame -- a direct one-off poke to BPLCON0 would just get
-		// overwritten again on the very next frame. Patching the
-		// copper's own source value instead makes 6-plane mode permanent
-		// with no per-frame maintenance needed. $1000*6|$200 mirrors
-		// SetupNonInterlacedScreen's own internal formula (graphics.tru:
-		// "j:=$1000*bpl | $200;") computed for bpl=6.
 		poke16(#copper_resolution, 0, $1000*6 | $200);
-
-		// CRITICAL, easy to get wrong silently: planes 3, 4, and 5 have
-		// never been written by anything (the whole project's color
-		// budget has always assumed only planes 0-2 exist) -- they're
-		// sitting on whatever garbage was already in chip RAM. Under
-		// 5-plane or 3-plane display, that garbage was invisible (never
-		// fetched). Under EHB's 6-plane mode, the display hardware
-		// fetches and composites ALL 6 planes into EVERY pixel's color
-		// index -- so uncleared garbage bits here would OR random noise
-		// into every color on screen the instant EHB engages. Must run
-		// before DrawBackground() (whose own FastFillBand calls only
-		// cover planes 0-2's real content; this clears the whole
-		// 256-row allocation of every plane 0-5 to a known state first,
-		// then DrawBackground fills planes 0-2's real 240 rows on top --
-		// redundant for 0-2, but harmless, and the only way to guarantee
-		// 3/4/5 start clean). Only needed when EHB is actually on --
-		// with it off, planes past DISPLAY_BITPLANES are never fetched
-		// by the display at all, so there's nothing to protect.
 		FastFillBand(0, 256, 0);
 	end else begin
-		// EHB fully off: exactly the pre-EHB behavior, just with
-		// DISPLAY_BITPLANES as a named, easy-to-change knob instead of a
-		// hardcoded literal. No BPL6PTH poke, no copper_resolution
-		// override, no extra FastFillBand call -- nothing here differs
-		// from how this project worked before EHB existed.
 		Graphics::SetupNonInterlacedScreen(#screen,DISPLAY_BITPLANES);
 	end;
+	*/
 
 	// DIAGNOSTIC/STEP 1 of the interrupt-driven main-loop migration --
 	// see VBlank/WaitVBlankIRQ's comments. Matches the ordering in every
@@ -2334,10 +3450,38 @@ begin
 	// adopting a full interrupt-driven architecture -- untested outside
 	// that documented pattern, so if the mark never appears, that
 	// mismatch is the first thing to suspect.
+	// ROOT-CAUSED at last, while wiring up the BLTPRI copper below: this
+	// mark never appeared because AddCopperCommand does NOT encode a
+	// raster line for you -- it is a raw two-word emitter ("move.w #arg1,
+	// (a5)+ / move.w #arg2,(a5)+", confirmed in main.asm). A copper WAIT
+	// wants the vertical position in the HIGH byte, i.e. (line<<8)|1, so
+	// passing a bare 44 emitted "$002c,$fffe" = "wait for VP=0, HP=$16".
+	// The copper reaches copper_custom having ALREADY passed line 44 (the
+	// static list waits for it just above), so VP=0 can never come true
+	// again this frame -- the copper simply stalled there until the next
+	// vblank restarted it, and the magenta write was never executed. It
+	// was never the "called outside a per-frame vbirq handler" mismatch
+	// the old comment suspected: calling it once is fine. The correct call
+	// would have been AddCopperCommand($2c01, COPPER_WAIT_FOR_RASTER).
+	// Disabled rather than fixed: InstallNastyCopper below writes to this
+	// same copper_custom area (from its start, same as
+	// InitCustomCopperList does), so the two cannot both be active.
+	/*
 	InitCustomCopperList();
 	AddCopperCommand(44, COPPER_WAIT_FOR_RASTER);
 	AddCopperCommand(COPPER_PALETTE_START, $0F0F); // magenta
 	EndCustomCopperList();
+	*/
+
+	// Blitter Nasty, copper-scoped -- see NASTY_MODE and
+	// InstallNastyCopper's own comments. Installed once here; the copper
+	// re-runs the list every frame by itself, so there is no per-frame
+	// upkeep (unlike EHB's BPL6PTH, which needed a VBlank() reset because
+	// bitplane pointers auto-increment -- DMACON does not).
+	if (NASTY_MODE=1) then begin
+		InstallNastyCopper();
+	end;
+
 
 	DrawBackground();
 
@@ -2349,63 +3493,49 @@ begin
 	// EHB_ENABLED=1 (plane 5 isn't fetched by the display at all
 	// otherwise, so this would be a harmless no-op, not a bug, if EHB is
 	// off -- gated anyway for clarity).
+	// PRE-REWRITE / DEFERRED along with the rest of EHB -- see Main's
+	// screen-setup comment above. FillShadowRect still addresses
+	// PLANE_SIZE*5, which is well past the end of the new, smaller
+	// #screen buffer -- must stay disabled even if EHB_ENABLED is
+	// flipped back on by mistake, until EHB itself is redesigned for the
+	// interleaved layout.
+	/*
 	if (EHB_ENABLED=1) then begin
-		// >>1, not /2 -- this codebase consistently uses bit-shifts for
-		// power-of-2 division (e.g. SetPixel's sx>>3) rather than "/",
-		// which has no proven, verified usage anywhere in this file.
 		FillShadowRect((SCREEN_W>>1)-20, (SCREEN_H>>1)-40, 40, 100);
 	end;
+	*/
 
 	// One-time full-screen capture into the permanent pristine reference
-	// -- see bg_pristine's own declaration comment. 20 words = SCREEN_W
-	// (320)/16 = the screen's real full row width in words; 3 planes,
-	// matching the color budget everything else already assumes. Reuses
-	// BlitSave exactly as the old per-frame SaveEntityBackgrounds() did,
-	// just once, for the whole screen, instead of every frame, per
-	// entity, for just its own footprint.
-	// FOUND A REAL BUG HERE: height must be 256, NOT SCREEN_H (240).
-	// BlitSave packs its destination TIGHTLY using stride=wwords*2*whgt
-	// per plane -- passing SCREEN_H gave a 20*2*240=9600-byte-per-plane
-	// stride, but RestoreFromPristine (and bg_pristine's own declared
-	// size) assume a PLANE_SIZE (40*256=10240-byte) per-plane stride,
-	// matching #screen's own real layout. That 640-byte-per-plane
-	// mismatch meant RestoreFromPristine's plane-1 and plane-2 reads
-	// landed ~16 rows into the WRONG part of bg_pristine -- wrong colors
-	// in restored rectangles (plane 0 was unaffected: PLANE_SIZE*0=0
-	// regardless of what PLANE_SIZE actually is). Passing 256 makes the
-	// captured stride 20*2*256=10240=PLANE_SIZE exactly. Rows 240-255
-	// captured this way are whatever was already sitting in the real
-	// screen buffer past SCREEN_H (never written by DrawBackground,
-	// likely stale/uninitialized) -- harmless, since nothing ever
-	// restores to a y-position back there anyway.
-	BlitSave(0, 0, 20, 256, 3, #bg_pristine);
+	// -- see bg_pristine's own declaration comment and CaptureBgPristine's
+	// own comment for why this is now a single whole-buffer blit instead
+	// of the old per-plane BlitSave(0, 0, 20, 256, 3, #bg_pristine) call.
+	CaptureBgPristine();
 
 	// Pre-render each entity's solid-color sprite once. Real per-entity
 	// colors restored (player=5, enemy=7, attack=6) now that the actual
 	// masked+shifted flashing bug is fixed (a bad mdshift=0 shortcut in
-	// BlitStampMasked -- see CLAUDE.md's "Masked+shifted entity flashing"
-	// section) -- color was never really the cause, just what gated
-	// whether the bug was visible, so any color is safe again. The
-	// shape-based distinction added while chasing this (enemy's inset
-	// double-ring border, see BuildBoxMaskInset below) is left in place
-	// too -- redundant with color now, but harmless, and free insurance
-	// if this bug or a similar one ever resurfaces.
-	// +1 row on every call: fills each sprite's hidden padding row (see
-	// its declaration comment) with the same solid fill as the real
-	// rows, instead of leaving it as whatever chip RAM happened to hold
-	// -- all three entities shift now, so all three need it.
-	BuildSprite(#player_sprite, PLAYER_SPR_WORDS*2, PLAYER_SPR_H+1, 5);
-	BuildSprite(#enemy_sprite, ENEMY_SPR_WORDS*2, ENEMY_SPR_H+1, 7);
-	BuildSprite(#attack_sprite, ATTACK_SPR_WORDS*2, ATTACK_SPR_H+1, 6);
+	// the old, true-planar BlitStampMasked -- see CLAUDE.md's "Masked+
+	// shifted entity flashing" section) -- color was never really the
+	// cause, just what gated whether the bug was visible, so any color is
+	// safe again. The shape-based distinction added while chasing this
+	// (enemy's inset double-ring border, see BuildBoxMaskInset below) is
+	// left in place too -- redundant with color now, but harmless.
+	// No more "+1" row on these calls: BuildSprite now takes the TRUE row
+	// count directly (see its own rewrite comment -- the interleaved
+	// layout's per-plane-chunk lookahead word replaces the old hidden
+	// padding ROW entirely).
+	BuildSprite(#player_sprite, PLAYER_SPR_WORDS*2, PLAYER_SPR_H, 5);
+	BuildSprite(#enemy_sprite, ENEMY_SPR_WORDS*2, ENEMY_SPR_H, 7);
+	BuildSprite(#attack_sprite, ATTACK_SPR_WORDS*2, ATTACK_SPR_H, 6);
 	// Real (non-rectangular) shape via masking, replacing the earlier
 	// synthetic chop-test edge now that per-pixel shifting is proven.
-	// +1 row on every call, same reason as BuildSprite's own +1 above.
-	// Player and enemy happen to share the same box size (32x64) but keep
-	// separate mask buffers/calls rather than sharing one, since nothing
-	// here enforces that they stay in sync if one changes later.
-	BuildBoxMask(#player_mask, PLAYER_SPR_WORDS*2, PLAYER_SPR_H+1, PLAYER_BOX_W);
-	BuildBoxMask(#enemy_mask, ENEMY_SPR_WORDS*2, ENEMY_SPR_H+1, ENEMY_BOX_W);
-	BuildBoxMask(#attack_mask, ATTACK_SPR_WORDS*2, ATTACK_SPR_H+1, ATTACK_BOX_W);
+	// No more "+1" row on these calls either, same reason as BuildSprite
+	// above. Player and enemy happen to share the same box size (32x64)
+	// but keep separate mask buffers/calls rather than sharing one, since
+	// nothing here enforces that they stay in sync if one changes later.
+	BuildBoxMask(#player_mask, PLAYER_SPR_WORDS*2, PLAYER_SPR_H, PLAYER_BOX_W);
+	BuildBoxMask(#enemy_mask, ENEMY_SPR_WORDS*2, ENEMY_SPR_H, ENEMY_BOX_W);
+	BuildBoxMask(#attack_mask, ATTACK_SPR_WORDS*2, ATTACK_SPR_H, ATTACK_BOX_W);
 	// Player and enemy share an identical 32x64 box (matching their
 	// identical real hitbox dimensions), so with color no longer
 	// distinguishing them, the enemy gets a second, inset border -- a
@@ -2413,16 +3543,52 @@ begin
 	// Attack doesn't need this: its 43x21 box is already a different
 	// shape/aspect ratio from either. Inset of 4px leaves a clearly
 	// visible gap between the two rings at this box size.
-	BuildBoxMaskInset(#enemy_mask, ENEMY_SPR_WORDS*2, ENEMY_SPR_H+1, ENEMY_BOX_W, 4);
-	// EXPERIMENTAL wide-enemy mask -- see WIDE_ENEMY_BOX_W's declaration
-	// comment. To disable the whole test entity, comment out this call
-	// plus the Update/Restore/Save/Draw calls below (search "EXPERIMENTAL").
+	BuildBoxMaskInset(#enemy_mask, ENEMY_SPR_WORDS*2, ENEMY_SPR_H, ENEMY_BOX_W, 4);
+
+	// Pre-shifted equivalents of everything above, for SPRITE_MODE=1 (see
+	// its own declaration comment). NOW GATED on SPRITE_MODE, having first
+	// been built unconditionally: generating 16 per-pixel-drawn variants of
+	// three entities is slow enough to be visibly annoying at startup, and
+	// paying it on every run to keep a dormant path warm is not a trade
+	// worth making. Note the argument differences from the calls above --
+	// *_SPR_WORDS*2 here is the TRUE per-plane chunk width (no lookahead
+	// word added inside, unlike BuildSprite/BuildBoxMask which add +2
+	// themselves), and the PS mask builders loop over all NUM_SHIFTS
+	// variants internally, so there is still exactly one call each.
+	if (SPRITE_MODE=1) then begin
+	BuildSpritePS(#player_sprite_ps, PLAYER_SPR_WORDS*2, PLAYER_SPR_H, 5);
+	BuildSpritePS(#enemy_sprite_ps, ENEMY_SPR_WORDS*2, ENEMY_SPR_H, 7);
+	BuildSpritePS(#attack_sprite_ps, ATTACK_SPR_WORDS*2, ATTACK_SPR_H, 6);
+	BuildBoxMaskPS(#player_mask_ps, PLAYER_SPR_WORDS*2, PLAYER_SPR_H, PLAYER_BOX_W);
+	BuildBoxMaskPS(#enemy_mask_ps, ENEMY_SPR_WORDS*2, ENEMY_SPR_H, ENEMY_BOX_W);
+	BuildBoxMaskPS(#attack_mask_ps, ATTACK_SPR_WORDS*2, ATTACK_SPR_H, ATTACK_BOX_W);
+	// Enemy's distinguishing inset ring, same as the non-PS path above.
+	BuildBoxMaskInsetPS(#enemy_mask_ps, ENEMY_SPR_WORDS*2, ENEMY_SPR_H, ENEMY_BOX_W, 4);
+	end;
+	// PRE-REWRITE / DEFERRED -- the wide enemy test entity (and
+	// BlitStampMasked1Plane it depends on) hasn't been ported to the
+	// interleaved layout -- see NUM_PLANES's own comment. Its
+	// Update/Restore/Save/Draw calls below are already commented out;
+	// this mask-build call is too, so wide_enemy_mask is simply never
+	// initialized for now (harmless, since nothing reads it while those
+	// calls stay disabled).
+	/*
 	BuildBoxMask(#wide_enemy_mask, WIDE_ENEMY_SPR_WORDS*2, WIDE_ENEMY_SPR_H+1, WIDE_ENEMY_BOX_W);
+	*/
 	// No more "prime the save buffers" step here: bg_pristine (captured
 	// above, right after DrawBackground()) is already valid for the very
 	// first RestoreEntities() call at the top of the loop below -- unlike
 	// the old per-entity save buffers, it doesn't need a frame-zero
 	// priming call to have something correct to restore from.
+
+	// NASTY_MODE=3: set BLTPRI once, here, and never clear it -- see
+	// NASTY_MODE's own declaration comment. Deliberately the LAST thing the
+	// setup block does, so nothing running before the main loop can write
+	// DMACON and clear it back out. Nothing in the loop clears it either:
+	// BlitterNastyOff is only ever called under mode 2.
+	if (NASTY_MODE=3) then begin
+		BlitterNastyOn();
+	end;
 
 	while (isDone=0) do begin
 		// STEP 3 of the frame-timing plan (see CLAUDE.md): ReadKeyboard is
@@ -2451,19 +3617,43 @@ begin
 		// border staying on the last color, or flickering unpredictably)
 		// -- that would mean this frame's total work already ate the
 		// whole vblank period.
+		
+
+		
+		// GAME LOGIC MOVED: it used to sit HERE, above the line-254 wait and
+		// above RestoreEntities -- which is the exact ordering bug this
+		// file's own comments (and CLAUDE.md) already warn about, regressed.
+		// RestoreEntities must read the OLD px/py/ex/ey to know where to
+		// erase; Update* overwrites those with the NEW positions. With
+		// Update first, Restore erases where the entity is about to BE, not
+		// where it WAS, so the previous frame's pixels are never cleaned up.
+		// See the restore phase below for where it lives now.
+		//UpdateWideEnemy(); // EXPERIMENTAL
+		// Deliberately still off, and NOT because they're unported: these
+		// two are pure gameplay (they set e_alive[i]:=0 on a kill), so
+		// enabling them makes the live enemy count drop mid-run, which
+		// would quietly confound every NUM_ENEMIES capacity measurement
+		// this file's "Next steps" depends on. Rendering does not need
+		// them -- UpdatePlayer sets atk_active on its own, so the attack
+		// box draws and erases correctly with these off. Turn them on
+		// when moving from "the rewrite is done" to actual gameplay.
+		//CheckPlayerAttackHits();
+		//CheckEnemyAttackHits();
+		
 		ProfMark($0888); // neutral: deliberately waiting for line 254
 		WaitForVisibleEnd();
 
-		ProfMark($0F0F); // magenta: restore (needs OLD positions -- must run before Update)
-		RestoreEntities();
-		//RestoreWideEnemy(); // EXPERIMENTAL -- see WIDE_ENEMY_BOX_W's comment
-
-		ProfMark($00F0); // green: game logic (update/collision) -- changes positions
-		UpdatePlayer();
-		UpdateEnemies();
-		//UpdateWideEnemy(); // EXPERIMENTAL
-		//CheckPlayerAttackHits();
-		//CheckEnemyAttackHits();
+		// Blitter Nasty, CPU-scoped (NASTY_MODE=2) -- see NASTY_MODE's own
+		// declaration comment. Scoped to exactly the deferred blit block
+		// rather than to a raster position, which makes it both the
+		// simplest correct option and a useful A/B control for the copper
+		// version: if mode 1 and mode 2 measure the same on ProfMark's
+		// borders, the copper's DMACON writes are definitely landing.
+		// Mode 1 does nothing here -- the copper owns BLTPRI in that mode
+		// and the CPU must not fight it for the register.
+		if (NASTY_MODE=2) then begin
+			BlitterNastyOn();
+		end;
 
 		// No blue/save phase here by default: the active RestoreEntities/
 		// RestoreWideEnemy pull from the one-time bg_pristine capture in
@@ -2471,16 +3661,52 @@ begin
 		// SaveWideEnemy() still exist (kept for reference, see
 		// player_bg's declaration comment) but would need to be called
 		// here again if ever reactivated.
+		
+		ProfMark($0F0F); // magenta: restore (needs OLD positions -- must run before Update)
+		RestoreEntities();
 
-		// DIAGNOSTIC: enemy drawn before player (was: player then enemy) --
-		// same "goes-first" test as RestoreEntities.
+		// Restore -> Update -> Draw, the order CLAUDE.md says must never be
+		// broken. Deferring the WHOLE block behind the line-254 wait (rather
+		// than splitting it by "touches the screen or not") is the documented
+		// fix: Update*/Check* don't touch the screen, but they DO rewrite the
+		// positions Restore depends on, so they cannot be hoisted above it
+		// however tempting that looks.
+		ProfMark($00F0); // green: game logic (update/collision) -- changes positions
+		UpdatePlayer();
+		UpdateEnemies();
+		//RestoreWideEnemy(); // EXPERIMENTAL -- see WIDE_ENEMY_BOX_W's comment
+
+
+		// *** DRAW ORDER IS LOAD-BEARING -- DO NOT REORDER CASUALLY. ***
+		// Player FIRST, enemies last. This is not a style choice and not
+		// the old "goes-first" flashing diagnostic (that was the reverse,
+		// enemy-first, and is what used to be here): it is the fix for the
+		// raster-deadline race described in CLAUDE.md.
+		//
+		// Everything drawn here is racing the beam. The redraw window runs
+		// from draw_start_line (204) to the raster line at which an entity
+		// is displayed; whatever is drawn LAST is the first to miss that
+		// deadline and vanish for the frame. Enemies never move vertically
+		// (ey[i] is fixed at 160), so their deadline is constant and is the
+		// latest one on screen. The player DOES move vertically and jumps,
+		// so the higher it goes the earlier its deadline -- which makes it
+		// the entity that must be drawn first. With this reversed, the
+		// player disappeared above screen line ~104 once 5 enemies were on
+		// screen; player-first fixed it.
 		ProfMark($0FF0); // yellow: draw (needs NEW positions)
-		DrawPlayer();		
-		DrawEnemies();		
+
+		DrawPlayer();
+		DrawEnemies();
 		//DrawPlayerBuiltinBlit();
 		//DrawWideEnemy(); // EXPERIMENTAL -- comment out along with the other
 		                  // 4 calls above (search "EXPERIMENTAL") to A/B
 		                  // test this against the baseline enemies alone
+
+		// Paired with the BlitterNastyOn above -- waits out the last blit
+		// still in flight before dropping priority, see BlitterNastyOff.
+		if (NASTY_MODE=2) then begin
+			BlitterNastyOff();
+		end;
 
 		ProfMark($0888); // back to neutral -- marks "done, waiting for vblank"
 		//WaitVBlankIRQ();
