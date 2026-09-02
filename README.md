@@ -4,7 +4,7 @@ Amiga BOB (Blitter Object) code, framework and examples.
 
 
 
-This project is built brick by brick to get fast, usable and as many as possible movable blitter objects (bobs) on screen as possible.
+This project is built brick by brick to get fast, usable and as many as possible movable blitter objects (bobs) on screen.
 
 
 
