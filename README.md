@@ -2,6 +2,7 @@
 
 Amiga BOB (Blitter Object) code, framework and examples.
 
+<img width="722" height="623" alt="image" src="https://github.com/user-attachments/assets/7a91a67e-5f7f-46bf-9218-f99ac65bbf8a" />
 
 
 This project is built brick by brick to get fast, usable and as many as possible movable blitter objects (bobs) on screen.
