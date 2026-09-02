@@ -22,11 +22,11 @@ Moving from a per sprite "cookie cutter" cleanup routine to just blitting copies
 
 
 
-There was a strong suspicion that we could increase this further by doing fewer but bigger blits, and initial testing on moving data from just 1 bitplane with x times increased block size (where x = number of bitplanes) indicated that we could get up to a theoretical 100% speed increase by moving to interleaved bitplanes, which allows moveing all the data for each object in one bigger chunk.
+There was a strong suspicion that we could increase this further by doing fewer but bigger blits, and initial testing on moving data from just 1 bitplane with x times increased block size (where x = number of bitplanes) indicated that we could get up to a theoretical 100% speed increase by moving to interleaved bitplanes, which allows moving all the data for each object in one bigger chunk.
 
 
 
-This, combined with turning on the so called "blitter nasty" flag gave us 7 objects, which is pretty close. 
+This, combined with turning on the so called "blitter nasty" flag gave us 7 moving objects, which is pretty close. 
 
 
 
