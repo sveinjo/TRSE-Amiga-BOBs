@@ -73,11 +73,14 @@ program bobs;
 	  exactly, which only exists under PAL (~312 lines/frame); under NTSC
 	  (~262 lines/frame) it never arrives and the program hangs. Since
 	  this project targets NTSC timings, frame pacing is interrupt-driven
-	  instead: interrupt VBlank() counts real vblanks and WaitVBlankIRQ()
-	  waits on that counter, never touching the hardware flag itself (two
-	  consumers racing one flag would hang). ApplyCopperList() is not
-	  needed: COP1LCH already points at the static compiled copper list
-	  from program init, so pokes into its data (palette, bitplane
+	  instead. SUPERSEDED since double buffering: it's no longer just
+	  "interrupt VBlank() counts real vblanks and the main loop waits on
+	  that counter" -- VBlank() now runs the ENTIRE per-frame pipeline
+	  itself (input, restore, update, draw, save, flip), and the main
+	  loop does nothing at all -- see VBlank's own header comment (near
+	  Main, below) for the full restructuring and why. ApplyCopperList()
+	  is not needed: COP1LCH already points at the static compiled copper
+	  list from program init, so pokes into its data (palette, bitplane
 	  pointers) take effect on the next frame automatically.
 
 	- The background (sky, floor, buildings, windows) is drawn ONCE,
@@ -497,7 +500,7 @@ var
 	// Starting X positions spread evenly across the real safe patrol
 	// range (ENEMY_CLAMP_MIN..MAX = 32..287, step 17, matching
 	// WIDE_ENEMY_CLAMP_MIN..MAX's own even-spread convention below).
-	const NUM_ENEMIES:integer = 6;
+	const NUM_ENEMIES:integer = 7;
 	ex : array[16] of integer = (132,149,166,183,200,217,234,151,168,185,202,219,236,253,270,287);
 	ey : array[16] of integer = (160,160,160,160,160,160,160,160,160,160,160,160,160,160,160,160);
 	e_alive       : array[16] of byte = (1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1);
@@ -533,8 +536,22 @@ var
 	buf_ex          : array[32] of integer = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
 	buf_ey          : array[32] of integer = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
 	buf_e_alive     : array[32] of byte    = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0);
-	buf_px          : array[2] of integer = (0,0);
-	buf_py          : array[2] of integer = (0,0);
+	// buf_px/buf_py start at the REAL player spawn position (matching
+	// px/py's own initial values), NOT (0,0) -- unlike enemies (gated by
+	// buf_e_alive) and the attack box (gated by buf_atk_active), the
+	// player's restore in RestoreEntitiesDB runs UNCONDITIONALLY every
+	// frame, with no "nothing to restore yet" skip. Starting at (0,0)
+	// made the very first restore for each buffer compute row
+	// "0 - 0 - 64 = -64" -- a negative row that was never reachable in
+	// the original single-buffer code (which always started from the
+	// real py=160) -- sending the blitter to an essentially random chip
+	// address on that one frame. Nothing ever revisits/cleans that one
+	// bad write on later, correctly-positioned frames, so it sat there
+	// as a permanent corrupted patch -- the "mysterious artifact" this
+	// fixes. Starting at the real spawn position makes that first
+	// restore a harmless background-over-background no-op instead.
+	buf_px          : array[2] of integer = (32,32);
+	buf_py          : array[2] of integer = (160,160);
 	buf_jump_height : array[2] of integer = (0,0);
 	buf_atk_active  : array[2] of byte = (0,0);
 	buf_atk_x       : array[2] of integer = (0,0);
@@ -779,14 +796,15 @@ var
 
 	// DIAGNOSTIC/STEP 1 of the interrupt-driven main-loop migration:
 	// vblank_count is incremented once by the VBlank interrupt handler
-	// below every time it fires; last_loop_vblank is the main loop's own
-	// record of the last value it saw. WaitVBlankIRQ() busy-waits for
-	// vblank_count to change instead of polling INTREQR directly (see
-	// its own comment for why that matters), so this pair doubles as the
-	// proof that the interrupt is actually firing once per frame: if it
-	// isn't, WaitVBlankIRQ() never returns and the game freezes outright
-	// on the very first frame -- an unambiguous, impossible-to-miss
-	// failure signal, deliberately preferred over a subtler check.
+	// every time it fires; last_loop_vblank was the main loop's own
+	// record of the last value it saw, read by WaitVBlankIRQ() (see its
+	// own comment for why it busy-waits on this counter instead of
+	// polling INTREQR directly). Since the interrupt-does-everything
+	// restructuring (see VBlank's own header comment), the main loop no
+	// longer paces itself this way at all -- WaitVBlankIRQ() is dormant,
+	// and last_loop_vblank along with it. vblank_count itself is still
+	// incremented every frame (harmless, and a useful "is the interrupt
+	// really firing" diagnostic if anything ever goes quiet).
 	vblank_count : integer;
 	last_loop_vblank : integer;
 
@@ -1739,6 +1757,54 @@ begin
 	end;
 end;
 
+// OPTIMIZATION (post-double-buffering profiling pass): pokes JUST the 3
+// bitplane-pointer copper slots (copper_bitplane0/1/2), instead of calling
+// the full Graphics::SetupDefaultScreen every frame the way FlipBuffer
+// originally did. SetupDefaultScreen also re-pokes copper_resolution and
+// copper_mod_even/odd (poke16 calls) and walks a bpl=5/4/3/2/1 comparison
+// chain -- all of which is dead weight called ONCE PER FRAME, forever,
+// even though none of those values ever change (DISPLAY_BITPLANES is a
+// fixed const): only the pointer itself differs between calls. This
+// procedure hand-rolls exactly the SetCopperList32 poke pattern
+// SetupDefaultScreen's own bpl=3 branch performs (confirmed against this
+// project's own compiled main.asm: two "move.w dN,label+6" / "swap" /
+// "move.w dN,label+2" pairs per plane, stepping the source pointer by 40
+// bytes between planes -- see FlipBuffer's own comment for the fuller
+// "why this is safe/cheap at all" reasoning, which still applies
+// unchanged here), referencing the copper_bitplaneN labels directly the
+// same way InstallNastyCopper already references copper_custom.
+//
+// Hardcodes exactly 3 planes/copper_bitplane0..2, matching NUM_PLANES=
+// DISPLAY_BITPLANES=3 today -- deliberately NOT parameterized by
+// DISPLAY_BITPLANES the way SetupDefaultScreen is. If DISPLAY_BITPLANES
+// is ever raised again for real (see its own declaration comment), this
+// procedure needs a 4th/5th poke added (copper_bitplane3/4, each a
+// further +40 bytes / +8 label bytes along the same pattern) or
+// FlipBuffer needs to fall back to calling Graphics::SetupDefaultScreen
+// again -- it will NOT silently do the right thing on its own.
+procedure FlipToBuffer(fbbuf : pointer of byte);
+begin
+	asm("
+		move.l fbbuf,d0
+		lea copper_bitplane0,a0
+		move.w d0,6(a0)
+		swap d0
+		move.w d0,2(a0)
+		move.l fbbuf,d0
+		add.l #40,d0
+		lea copper_bitplane1,a0
+		move.w d0,6(a0)
+		swap d0
+		move.w d0,2(a0)
+		move.l fbbuf,d0
+		add.l #80,d0
+		lea copper_bitplane2,a0
+		move.w d0,6(a0)
+		swap d0
+		move.w d0,2(a0)
+	");
+end;
+
 // Makes cur_buf's buffer (the one this frame just finished drawing into)
 // the new FRONT/displayed buffer, then flips cur_buf/draw_target so the
 // NEXT frame draws into the buffer that is now safely off-screen again.
@@ -1749,18 +1815,14 @@ end;
 // running. Waiting here guarantees the buffer is fully, consistently
 // drawn before it can become visible.
 //
-// The flip itself is just calling Graphics::SetupDefaultScreen again --
-// see graphics.tru: it does nothing but poke16(copper_resolution,...) and
-// a few SetCopperList32 calls, which themselves just write two 16-bit
-// words into the ALREADY-EXISTING static copper list's copper_bitplaneN
-// slots (confirmed against this project's own compiled main.asm -- see
-// CLAUDE.md's "double buffering" notes). It is a handful of register
-// pokes, not a data-moving operation, so calling it again here every
-// frame costs nothing like a screen-sized blit would -- this is exactly
-// the insight that made double buffering worth doing in the first place
-// (see CLAUDE.md: testing with a full-screen blit substituted for
-// RestoreEntities measured the cost of an operation double buffering
-// never needs to perform).
+// The flip itself pokes the copper's own bitplane-pointer words directly
+// (FlipToBuffer, see its own comment for why this replaced calling
+// Graphics::SetupDefaultScreen here) -- a handful of register pokes, not
+// a data-moving operation, so doing this every frame costs nothing like a
+// screen-sized blit would -- this is exactly the insight that made double
+// buffering worth doing in the first place (see CLAUDE.md: testing with a
+// full-screen blit substituted for RestoreEntities measured the cost of
+// an operation double buffering never needs to perform).
 //
 // The copper only re-executes copper_bitplaneN once per real vertical
 // blank (COP1LC reloads the copper's program counter at every vblank, so
@@ -1776,11 +1838,11 @@ begin
 		bne.s FlipBufferWait
 	");
 	if (cur_buf=0) then begin
-		Graphics::SetupDefaultScreen(#screen, DISPLAY_BITPLANES);
+		FlipToBuffer(#screen);
 		cur_buf := 1;
 		draw_target := #screen2;
 	end else begin
-		Graphics::SetupDefaultScreen(#screen2, DISPLAY_BITPLANES);
+		FlipToBuffer(#screen2);
 		cur_buf := 0;
 		draw_target := #screen;
 	end;
@@ -1823,37 +1885,64 @@ begin
 	if (raw_code=KEY_X) then x_h:=raw_down;
 end;
 
-// Kept unused, for reference -- see WaitVBlankIRQ below, now used
-// instead. Reason: a real interrupt handler (EnableInterrupt(VB_IRQ),
-// set up in the program's own top-level setup) also watches this exact
-// same VERTB flag and presumably auto-acknowledges it as part of servicing the
-// interrupt. Running MyWaitVBlank's own polling loop AND the interrupt
-// handler concurrently risks the interrupt clearing the flag before this
-// loop's own poll ever sees it set, which would hang this loop forever
-// (two consumers racing for one flag). WaitVBlankIRQ sidesteps that by
-// never touching INTREQR itself at all -- only the interrupt handler
-// does -- and instead watches a plain software counter the handler
-// increments.
-//
-// DIAGNOSTIC/STEP 1 of the interrupt-driven main-loop migration: the
-// simplest possible handler, just counts how many times it's fired.
-// Later steps will move real work here (keyboard polling first, per the
-// plan), but this step is deliberately just the scaffolding, to prove
-// the interrupt mechanism itself works in this program before building
-// on it.
-interrupt VBlank();
-begin
-	vblank_count := vblank_count + 1;
+// interrupt VBlank() itself moved to just before Main, after every
+// procedure it now calls (RestoreEntitiesDB, UpdatePlayer, DrawEnemies,
+// etc.). TRSE does support forward references (confirmed directly by the
+// user) -- this project just hadn't exercised one anywhere before, so the
+// move was precautionary rather than required, and was left in place
+// once made since it costs nothing and every other call in this file
+// happens to be backward-only anyway (keeps that pattern consistent).
+// See its new location's own header comment for the full per-frame-
+// work-moved-into-the-interrupt restructuring writeup -- vblank_count/
+// WaitVBlankIRQ's OLD role (the main loop's own busy-wait pacing
+// mechanism) is superseded by that move;
+// WaitVBlankIRQ itself is left declared, unused, for reference below.
 
-end;
-
-// See VBlank/vblank_count's comments above for why this replaces
-// MyWaitVBlank as the main loop's frame-pace wait.
+// UNUSED as of the interrupt-driven-main-loop restructuring (see VBlank's
+// own header comment, near Main below) -- kept declared, for reference,
+// same pattern as MyWaitVBlank below it. Previously replaced MyWaitVBlank
+// as the main loop's own busy-wait frame-pace mechanism; now the main
+// loop doesn't pace itself at all, since VBlank() drives the whole
+// per-frame pipeline directly and only ever fires once per real vblank.
 procedure WaitVBlankIRQ();
 begin
 	while (vblank_count=last_loop_vblank) do begin
 	end;
 	last_loop_vblank := vblank_count;
+end;
+
+// Genuine CPU-halt for the now-empty main loop (see its own comment, near
+// Main): the 68000 STOP instruction loads the given 16-bit value into SR,
+// then stops fetching/executing entirely until ANY interrupt whose
+// priority exceeds the resulting IPL mask occurs, at which point it
+// resumes at the instruction right after STOP -- unlike the empty
+// while-loop this replaces, the CPU is not executing NOP-equivalent
+// iterations while idle, it is doing nothing at all.
+//
+// $2000 = supervisor bit (13) set, IPL mask (bits 8-10) at 0, trace (15)
+// off, condition codes cleared. IPL=0 is the standard "wake on anything"
+// choice and sidesteps needing to know VERTB's exact hardware priority
+// level (Amiga groups it under INT3/level 3): since interrupts are
+// already firing and being serviced correctly elsewhere in this program,
+// the CPU's OWN interrupt mask is necessarily already low enough for that
+// to happen, and 0 is the lowest it can be, so this can only be at least
+// as permissive as whatever's already working.
+//
+// STOP is PRIVILEGED -- requires supervisor mode. Not independently
+// confirmed for this program (inferred only from EnableInterrupt/vbirq
+// needing supervisor privilege themselves to install interrupt vectors,
+// and from every other low-level register poke in this file working
+// without incident) -- if this instead crashes/guru-meditates
+// immediately, that is the first thing to suspect: the program may be
+// running in user mode, in which case STOP needs a supervisor-mode
+// transition first (a separate, bigger undertaking) rather than being
+// usable directly here. UNTESTED as of this edit -- first thing to try
+// if the screen goes blank/frozen/garbage the instant this is reached.
+procedure IdleUntilInterrupt();
+begin
+	asm("
+		stop #$2000
+	");
 end;
 
 // DIAGNOSTIC: writes an Amiga 12-bit color ($0RGB) directly to COLOR00
@@ -2400,6 +2489,199 @@ begin
 	buf_atk_y[cur_buf] := atk_y;
 end;
 
+// ========================================================================
+// VBlank interrupt -- now drives the ENTIRE per-frame pipeline
+// ========================================================================
+//
+// MAJOR RESTRUCTURING (post-double-buffering): previously this handler
+// only incremented vblank_count, and the MAIN LOOP did all per-frame work
+// (input, restore, update, draw, save, flip) synchronously, then called
+// WaitVBlankIRQ() -- a literal empty busy-wait (see its own comment,
+// above SaveBufferPositions in this file... actually near ReadKeyboard,
+// see WaitVBlankIRQ's own declaration) -- to pace itself to the next real
+// vblank. That wasted the CPU for however much of the frame was left
+// over after the (usually fast, blitter-bound -- see the ProfMark
+// band-split comments below) work finished, and gave the main loop
+// nothing useful to do even once there IS other work to give it (planned:
+// music playback, more copper effects -- see Main's own trimmed loop
+// comment for where that goes).
+//
+// Moved here instead: everything that must happen once per frame now
+// runs directly inside the interrupt, triggered by the real hardware
+// vblank itself -- which ALSO structurally guarantees "at most once per
+// real vblank" for FlipBuffer's own copper poke (see FlipBuffer's own
+// comment for why racing that poke against the copper's own read of the
+// same words was the exact bug that made WaitVBlankIRQ() need
+// reinstating earlier this session, after being disabled for unrelated
+// bandwidth stress-testing). Under the old main-loop-driven design, that
+// guarantee depended on remembering to call WaitVBlankIRQ() before the
+// next iteration; here it isn't something that can be forgotten -- the
+// interrupt simply doesn't fire more than once per real vblank, full
+// stop.
+//
+// Why moving blitter-touching code (RestoreEntitiesDB/DrawPlayer/
+// DrawEnemies) into an interrupt handler is SAFE here specifically,
+// despite the general hazard of two execution contexts touching the same
+// asynchronous hardware: as of this change, the main loop touches
+// NEITHER the blitter NOR any entity state at all -- this handler is the
+// ONLY place in the whole program that ever does. If the main loop is
+// ever given real background work later that reads or writes shared
+// state (ex[]/ey[]/px/py/e_alive/buf_*/draw_target/cur_buf, or anything
+// blitter-related), that state then needs protecting against this
+// handler firing mid-update -- either keep the main loop from touching it
+// directly (hand it a snapshot/queue instead) or briefly mask the VERTB
+// interrupt around the critical section. Not needed today, since nothing
+// else touches this state yet -- worth remembering before that stops
+// being true.
+//
+// ⚠ This hazard already bit once, in a place easy to overlook: Main's OWN
+// SETUP block. EnableInterrupt(VB_IRQ) originally sat right after screen
+// setup, well before DrawBackgroundImage/CopyScreenToScreen2/
+// CaptureBgPristine/BuildSprite/BuildBoxMask had built bg_pristine and the
+// sprite/mask buffers this handler blits against. VBlank() could fire on
+// the very next real vblank and start running its full pipeline WHILE
+// setup was still building those buffers -- observed directly as setup
+// running visibly slower and corrupted (VBlank()'s blitter operations
+// racing setup's own). Fixed by moving vbirq(VBlank())/EnableInterrupt
+// to the very end of setup, after everything this handler touches is
+// fully built -- see that call site's own comment. The lesson generalizes
+// beyond the main loop: ANY code that runs before EnableInterrupt(VB_IRQ)
+// and touches state this handler also touches has the same exposure,
+// setup included, not just steady-state background work.
+//
+// UNTESTED AS OF THIS EDIT: nothing in this project had previously put
+// more than a one-line counter increment inside interrupt VBlank(). The
+// register-save/restore prologue/epilogue TRSE generates for `interrupt`
+// procedures (movem.l d0-d7/a0-a6, confirmed via this file's own earlier
+// compiled-assembly inspection) should make calling arbitrary procedures
+// from here exactly as safe as calling them from the main loop -- but
+// that is an inference from a known mechanism, not something this
+// codebase has actually exercised at this depth (many nested procedure
+// calls, real blitter operations) before. Build and test before trusting
+// this -- if something goes wrong, the first thing to check is whether
+// it behaves differently than it did as main-loop code, which would
+// point at an interrupt-context-specific issue rather than a logic bug
+// carried over unchanged.
+interrupt VBlank();
+begin
+	vblank_count := vblank_count + 1;
+
+	// STEP 3 of the (now-completed) frame-timing plan: ReadKeyboard is
+	// genuinely independent (doesn't read or write any entity position),
+	// so it runs first. Restore/Update/Check/Save/Draw MUST stay in their
+	// original relative order and can't be split by "touches the screen
+	// or not" -- RestoreEntitiesDB needs cur_buf's OLD (history)
+	// positions (to know where to erase) and UpdatePlayer/UpdateEnemies
+	// overwrite the LIVE px/py/ex/ey with the NEW position, so Restore
+	// has to run before Update, not after. (Tried moving Update/Check
+	// before Restore in an earlier version of this loop -- broke exactly
+	// that dependency: Restore erased at the NEW position instead of the
+	// old one, leaving the previous frame's drawn content never properly
+	// cleaned up, visible as a horizontal trail/dashing along the
+	// enemy's patrol path. Reverted.) This ordering requirement is
+	// unrelated to which execution context (main loop, or here) runs the
+	// code, and still applies.
+	ProfMark($0F00); // red: input
+	ReadKeyboard();
+
+	// Gameplay collision. Both must run AFTER Update* (they read the new
+	// positions) and before Draw. CheckPlayerAttackHits clears an enemy
+	// by setting e_alive[i]:=0, which both stops it being drawn and stops
+	// RestoreEntitiesDB erasing at its last position -- that is correct,
+	// because the last thing drawn there was erased by the restore at
+	// the top of THIS frame, before the kill happened.
+	//
+	// NOTE FOR CAPACITY TESTING: with these enabled the live enemy count
+	// drops as enemies are killed, so a NUM_ENEMIES ceiling measurement
+	// must be taken before any kills land (or with these two calls
+	// temporarily commented out again), or it will silently flatter
+	// itself.
+	CheckPlayerAttackHits();
+	CheckEnemyAttackHits();
+
+	// Blitter Nasty, CPU-scoped (NASTY_MODE=2) -- see NASTY_MODE's own
+	// declaration comment. Scoped to exactly the deferred blit block
+	// rather than to a raster position, which makes it both the simplest
+	// correct option and a useful A/B control for the copper version: if
+	// mode 1 and mode 2 measure the same on ProfMark's borders, the
+	// copper's DMACON writes are definitely landing. Mode 1 does nothing
+	// here -- the copper owns BLTPRI in that mode and the CPU must not
+	// fight it for the register.
+	if (NASTY_MODE=2) then begin
+		BlitterNastyOn();
+	end;
+
+	// No save phase: RestoreEntitiesDB pulls from the one-time
+	// bg_pristine capture in the setup block, so there is nothing to
+	// snapshot per frame. See bg_pristine's own declaration comment.
+	// RestoreEntitiesDB (not RestoreEntities) reads cur_buf's own
+	// position HISTORY, not the live px/py/ex/ey/atk_* globals -- see its
+	// own declaration comment for why that distinction matters under
+	// double buffering.
+	// PROFILING (added post-double-buffering, to answer the "how much of
+	// the frame is CPU loop/procedure-call overhead vs blitter time"
+	// question raised in CLAUDE.md before committing to merging
+	// RestoreEntitiesDB/UpdateEnemies/DrawEnemies/SaveBufferPositions
+	// into one combined per-enemy loop): restore and update used to share
+	// the SAME magenta marker, making them visually indistinguishable as
+	// one merged band. Split into magenta (restore -- blitter-BOUND,
+	// dominated by BBUSY waits + DMA) and green (update -- PURE CPU, no
+	// blitter touched at all) so their border-band heights can be
+	// compared directly. Measured thin (green) -- confirms the
+	// loop-merge idea isn't worth the risk right now; bandwidth, not CPU
+	// overhead, is what the 7/8-enemy ceiling is made of.
+	ProfMark($0F0F); // magenta: restore (blitter-bound -- BBUSY waits + DMA)
+	RestoreEntitiesDB();
+
+	// Restore -> Update -> Draw, the order CLAUDE.md says must never be
+	// broken: RestoreEntitiesDB needs cur_buf's OLD (history) positions,
+	// still untouched at this point, and Update*/Check* rewrite the live
+	// px/py/ex/ey/atk_* globals that DrawPlayer/DrawEnemies (and
+	// SaveBufferPositions, right after) depend on next -- so Update/Check
+	// cannot be hoisted above Restore however tempting that looks.
+	ProfMark($00F0); // green: game logic (update/collision) -- PURE CPU, no blitter at all
+	UpdatePlayer();
+	UpdateEnemies();
+
+	// Draw order (currently enemies-first, player-last) is NOT
+	// load-bearing -- swap freely if ever useful. It used to be: under
+	// single buffering, everything drawn here was racing the beam, and
+	// whatever drew LAST was first to miss its deadline and vanish for
+	// the frame, which made player-first/enemies-last a real fix (see
+	// CLAUDE.md). Double buffering removes that deadline entirely --
+	// draw_target is never the buffer currently being scanned out, so
+	// there is no beam left to race regardless of order.
+	ProfMark($0E00); // dark red: draw (blitter-bound -- BBUSY waits + DMA)
+	DrawEnemies();
+	DrawPlayer();
+
+	// Paired with the BlitterNastyOn above -- waits out the last blit
+	// still in flight before dropping priority, see BlitterNastyOff.
+	if (NASTY_MODE=2) then begin
+		BlitterNastyOff();
+	end;
+
+	// PROFILING (see the restore/update split above for the full
+	// reasoning): SaveBufferPositions is PURE CPU (a plain array copy, no
+	// blitter), same category as the green "update" band -- splitting it
+	// out from dark-red "draw" isolates its own loop overhead instead of
+	// hiding it inside the blitter-bound band. FlipBuffer's own BBUSY
+	// wait is included here too (small and already cheap after the
+	// FlipToBuffer optimization above).
+	ProfMark($000F); // blue: save positions -- PURE CPU, no blitter at all
+	// Commit this frame's positions into cur_buf's own history (needed
+	// the next time this buffer becomes the back buffer, two frames from
+	// now -- see SaveBufferPositions' own comment), THEN flip: make
+	// cur_buf's now-fully-drawn buffer the new front buffer and swap
+	// cur_buf/draw_target for the next interrupt firing. FlipBuffer
+	// itself waits for DrawEnemies' last, still-in-flight blit to
+	// actually finish before flipping -- see its own comment.
+	SaveBufferPositions();
+	FlipBuffer();
+
+	ProfMark($0F00); // back to red -- marks "done" until the next vblank fires
+end;
+
 
 // ========================================================================
 // Main
@@ -2436,12 +2718,6 @@ begin
 	Graphics::SetupDefaultScreen(#screen, DISPLAY_BITPLANES);
 
 
-	// DIAGNOSTIC/STEP 1 of the interrupt-driven main-loop migration --
-	// see VBlank/WaitVBlankIRQ's comments. Matches the ordering in every
-	// TRSE copper/interrupt tutorial found (screen setup first, then
-	// wire up the interrupt).
-	vbirq(VBlank());
-	EnableInterrupt(VB_IRQ);
 
 	// setpalette's count compiles to a dbf loop, which always runs
 	// count+1 times -- passing 32 here actually performed 33 writes,
@@ -2579,182 +2855,69 @@ begin
 
 	// No more "prime the save buffers" step here: bg_pristine (captured
 	// above, right after DrawBackground()) is already valid for the very
-	// first RestoreEntitiesDB() call at the top of the loop below -- unlike
-	// the old per-entity save buffers, it doesn't need a frame-zero
-	// priming call to have something correct to restore from.
+	// first RestoreEntitiesDB() call VBlank() makes (see its own header
+	// comment -- the whole per-frame pipeline now lives there, not in the
+	// loop below) -- unlike the old per-entity save buffers, it doesn't
+	// need a frame-zero priming call to have something correct to
+	// restore from.
 
 	// NASTY_MODE=3: set BLTPRI once, here, and never clear it -- see
-	// NASTY_MODE's own declaration comment. Deliberately the LAST thing the
-	// setup block does, so nothing running before the main loop can write
-	// DMACON and clear it back out. Nothing in the loop clears it either:
+	// NASTY_MODE's own declaration comment. Nothing running before this
+	// point writes DMACON, and nothing after it clears BLTPRI back out:
 	// BlitterNastyOff is only ever called under mode 2.
 	if (NASTY_MODE=3) then begin
 		BlitterNastyOn();
 	end;
 
+	// MOVED here (was right after screen setup, before DrawBackgroundImage/
+	// CopyScreenToScreen2/CaptureBgPristine/BuildSprite/BuildBoxMask) --
+	// deliberately the LAST thing the whole setup block does, once
+	// everything VBlank() touches is fully built. This is now the ONE
+	// real synchronization point the whole interrupt-driven-pipeline
+	// restructuring depends on: EnableInterrupt(VB_IRQ) is what lets
+	// VBlank() actually start firing, and VBlank() now runs the ENTIRE
+	// per-frame pipeline (see its own header comment) -- including
+	// blitting against bg_pristine and the sprite/mask buffers. With the
+	// old, earlier position, VBlank() could fire (on the very next real
+	// vblank) and start running that pipeline WHILE those buffers were
+	// still being built by this same setup block -- a real, observed bug
+	// (visibly slow, corrupted setup, since VBlank()'s own blitter
+	// operations were racing DrawBackgroundImage/CopyScreenToScreen2/
+	// CaptureBgPristine/BuildSprite/BuildBoxMask's), not a hypothetical
+	// one. This is the exact same class of hazard VBlank()'s own header
+	// comment warns about for the MAIN LOOP touching shared state later
+	// -- it just turned out to apply to this setup block too, which
+	// wasn't anticipated when the interrupt was first wired up here.
+	vbirq(VBlank());
+	EnableInterrupt(VB_IRQ);
+
+
+	// ------------------------------------------------------------------
+	// Main loop -- now empty by design
+	// ------------------------------------------------------------------
+	// Everything that has to happen once per frame moved into the VBlank
+	// interrupt handler above (see its own header comment for the full
+	// restructuring reasoning) -- this loop no longer does per-frame work,
+	// doesn't wait on a raster/copper condition, and doesn't spin on
+	// vblank_count. This is where FUTURE non-urgent, non-blitter
+	// background work belongs: anything that doesn't need to happen
+	// exactly once per frame, or can be spread across several frames,
+	// runs here, naturally overlapped with whatever's left of the frame
+	// after VBlank() finishes -- see VBlank()'s own comment for the
+	// shared-state hazard to design around once this actually holds code
+	// (it touches nothing VBlank() also touches yet, so nothing needs
+	// protecting today).
+	//
+	// IdleUntilInterrupt() (68000 STOP, see its own comment) replaces what
+	// was an empty while-loop body here: instead of the CPU fetching and
+	// executing NOP-equivalent iterations while there's nothing to do, it
+	// genuinely stops until the next interrupt (in practice, VBlank())
+	// wakes it. UNTESTED as of this edit, same caveat as IdleUntilInterrupt
+	// itself -- if the screen goes blank/frozen/garbage immediately, this
+	// call is the first thing to suspect (revert to a plain "while
+	// (isDone=0) do begin end;" with no call inside to isolate it).
 	while (isDone=0) do begin
-		// STEP 3 of the frame-timing plan (see CLAUDE.md): ReadKeyboard is
-		// genuinely independent (doesn't read or write any entity
-		// position), so it alone runs immediately. Restore/Update/Check/
-		// Save/Draw MUST stay in their original relative order and can't
-		// be split by "touches the screen or not" -- RestoreEntities
-		// needs the OLD px/py/ex/ey (to know where to erase) and
-		// UpdatePlayer/UpdateEnemies overwrite those same variables with
-		// the NEW position, so Restore has to run before Update, not
-		// after. (Tried moving Update/Check before Restore in an earlier
-		// version of this loop -- broke exactly that dependency: Restore
-		// erased at the NEW position instead of the old one, leaving the
-		// previous frame's drawn content never properly cleaned up,
-		// visible as a horizontal trail/dashing along the enemy's patrol
-		// path. Reverted.) So the whole Restore..Draw block stays together
-		// in its original order. It used to ALSO be deferred behind a
-		// line-254 raster wait (WaitForVisibleEnd) to avoid racing the
-		// beam -- that wait is gone under double buffering (see its
-		// removal comment below): Restore/Draw now write into draw_target,
-		// never the buffer currently on screen, so there's no beam left to
-		// race regardless of when in the frame this block runs.
-		ProfMark($0F00); // red: input
-		ReadKeyboard();
-
-		// DIAGNOSTIC: border-color phase markers -- see ProfMark's comment.
-		// Each color's band height in the border = raster lines that
-		// phase took. Watch for WaitVBlankIRQ never actually waiting (the
-		// border staying on the last color, or flickering unpredictably)
-		// -- that would mean this frame's total work already ate the
-		// whole vblank period.
-		
-
-		
-		// GAME LOGIC MOVED: it used to sit HERE, above the line-254 wait and
-		// above RestoreEntities -- which is the exact ordering bug this
-		// file's own comments (and CLAUDE.md) already warn about, regressed.
-		// RestoreEntities must read the OLD px/py/ex/ey to know where to
-		// erase; Update* overwrites those with the NEW positions. With
-		// Update first, Restore erases where the entity is about to BE, not
-		// where it WAS, so the previous frame's pixels are never cleaned up.
-		// See the restore phase below for where it lives now.
-		// Gameplay collision. Both must run AFTER Update* (they read the
-		// new positions) and before Draw. CheckPlayerAttackHits clears an
-		// enemy by setting e_alive[i]:=0, which both stops it being drawn
-		// and stops RestoreEntitiesDB erasing at its last position -- that
-		// is correct, because the last thing drawn there was erased by the
-		// restore at the top of THIS frame, before the kill happened.
-		//
-		// NOTE FOR CAPACITY TESTING: with these enabled the live enemy
-		// count drops as enemies are killed, so a NUM_ENEMIES ceiling
-		// measurement must be taken before any kills land (or with these
-		// two calls temporarily commented out again), or it will silently
-		// flatter itself.
-		CheckPlayerAttackHits();
-		CheckEnemyAttackHits();
-
-		// WaitForVisibleEnd() is GONE here under double buffering, and
-		// deliberately not just skipped but removed from this path: the
-		// whole reason it existed was to avoid touching the buffer the
-		// beam is currently scanning out. RestoreEntitiesDB/DrawPlayer/
-		// DrawEnemies below all write into draw_target -- the buffer that
-		// is, by construction, never the one currently displayed -- so
-		// there is no beam to race and no raster deadline left at all
-		// (see CLAUDE.md's "double buffering" notes). The procedure itself
-		// is left declared, unused, as a single-buffer fallback/reference.
-
-		// Blitter Nasty, CPU-scoped (NASTY_MODE=2) -- see NASTY_MODE's own
-		// declaration comment. Scoped to exactly the deferred blit block
-		// rather than to a raster position, which makes it both the
-		// simplest correct option and a useful A/B control for the copper
-		// version: if mode 1 and mode 2 measure the same on ProfMark's
-		// borders, the copper's DMACON writes are definitely landing.
-		// Mode 1 does nothing here -- the copper owns BLTPRI in that mode
-		// and the CPU must not fight it for the register.
-		if (NASTY_MODE=2) then begin
-			BlitterNastyOn();
-		end;
-
-		// No save phase: RestoreEntitiesDB pulls from the one-time
-		// bg_pristine capture in the setup block, so there is nothing to
-		// snapshot per frame. See bg_pristine's own declaration comment.
-		// RestoreEntitiesDB (not RestoreEntities) reads cur_buf's own
-		// position HISTORY, not the live px/py/ex/ey/atk_* globals -- see
-		// its own declaration comment for why that distinction matters
-		// under double buffering.
-		ProfMark($0F0F); // magenta: restore (needs THIS BUFFER's own last-drawn positions -- must run before Update)
-		RestoreEntitiesDB();
-
-		// Restore -> Update -> Draw, the order CLAUDE.md says must never be
-		// broken: RestoreEntitiesDB needs cur_buf's OLD (history) positions,
-		// still untouched at this point, and Update*/Check* rewrite the live
-		// px/py/ex/ey/atk_* globals that DrawPlayer/DrawEnemies (and
-		// SaveBufferPositions, right after) depend on next -- so Update/Check
-		// cannot be hoisted above Restore however tempting that looks. No
-		// longer deferred behind a raster-line wait (see WaitForVisibleEnd's
-		// removal above) -- that was a single-buffer-only concern; this
-		// ordering requirement is unrelated to it and still applies.
-		//ProfMark($00F0); // green: game logic (update/collision) -- changes positions
-		ProfMark($0F0F); // magenta: game logic (update/collision) -- changes positions
-		UpdatePlayer();
-		UpdateEnemies();
-
-
-		// *** Player-first, enemies-last draw order -- NO LONGER LOAD-
-		// BEARING, kept only because there's no reason to touch it. ***
-		// This ordering was originally the fix for a raster-deadline race
-		// (see CLAUDE.md): under single buffering, everything drawn here
-		// was racing the beam, and whatever drew LAST was first to miss
-		// its deadline and vanish for the frame. Double buffering removes
-		// that deadline entirely -- draw_target is never the buffer
-		// currently being scanned out (see WaitForVisibleEnd's removal
-		// above and FlipBuffer's own comment), so there is no beam left to
-		// race and this order could be swapped freely. Left as player-
-		// first anyway: no benefit to changing it, and it's one less thing
-		// to have re-verified.
-		//ProfMark($0FF0); // yellow: draw (needs NEW positions)
-		ProfMark($0E00); // dark red: draw (needs NEW positions)
-
-		DrawPlayer();
-		DrawEnemies();
-
-		// Paired with the BlitterNastyOn above -- waits out the last blit
-		// still in flight before dropping priority, see BlitterNastyOff.
-		if (NASTY_MODE=2) then begin
-			BlitterNastyOff();
-		end;
-
-		// Commit this frame's positions into cur_buf's own history (needed
-		// the next time this buffer becomes the back buffer, two frames
-		// from now -- see SaveBufferPositions' own comment), THEN flip:
-		// make cur_buf's now-fully-drawn buffer the new front buffer and
-		// swap cur_buf/draw_target for the next iteration. FlipBuffer
-		// itself waits for DrawEnemies' last, still-in-flight blit to
-		// actually finish before flipping -- see its own comment.
-		SaveBufferPositions();
-		FlipBuffer();
-
-		//ProfMark($0888); // back to neutral -- marks "done, waiting for vblank"
-		ProfMark($0F00); // back to red -- marks "done, waiting for vblank"
-
-		// RE-ENABLED for double buffering -- this was commented out for
-		// bandwidth stress-testing (see CLAUDE.md), which pre-dates
-		// FlipBuffer entirely and was fine to run unthrottled: nothing
-		// else in the old single-buffer loop wrote into the copper's own
-		// program. FlipBuffer does -- it pokes copper_bitplane0/1/2's
-		// stored operand words directly (see its own comment). The copper
-		// re-executes that exact instruction once per real vblank,
-		// completely independently of our CPU loop's speed. With the loop
-		// unthrottled, FlipBuffer could fire hundreds of times between two
-		// real vblanks, each one rewriting those words via two separate
-		// 16-bit writes (high word, then low word) -- with no relationship
-		// to when the copper itself reads them. That's a real race: the
-		// copper can catch a torn pointer (mismatched high/low halves)
-		// mid-write, which reads as exactly the reported symptoms -- an
-		// intermittent burst of garbage/shifted background (a torn
-		// pointer, for one frame), and border-flash "two patterns" (the
-		// CPU racing ahead of the display by an unpredictable amount each
-		// real frame instead of a consistent one flip per vblank). Gating
-		// FlipBuffer behind WaitVBlankIRQ() (so it fires at most once per
-		// real vblank, with a whole frame's margin before the copper next
-		// reaches line 44) removes the race entirely -- see FlipBuffer's
-		// own comment for why a single well-timed poke is already safe.
-		WaitVBlankIRQ();
+		IdleUntilInterrupt();
 	end;
 
 end.
