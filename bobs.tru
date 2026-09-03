@@ -1,0 +1,1868 @@
+unit Bobs;
+
+// ============================================================================
+// Bobs -- Blitter OBject primitives, extracted from main.ras.
+//
+// CROSS-FILE IDENTIFIER RULES (learned empirically while doing this
+// extraction -- confirmed via the real headless CLI compiler, not just the
+// IDE's own diagnostics, which gave a false "'Interface' expected" error on
+// this file's very first line that the real compiler never raised):
+//
+//   1. A unit has its OWN separate variable namespace. Code inside this unit
+//      cannot read/write a var declared in main.ras by its plain name --
+//      confirmed by trying it (moving ClampWordCol here without also moving
+//      blk_result/shift_result failed to parse with "Could not find
+//      variable 'Bobs_blk_result'"). Any state this unit's procedures touch
+//      has to be declared HERE, in this unit's own var block.
+//   2. From main.ras, call a procedure declared here as "Bobs::ProcName(...)"
+//      (matches the existing Graphics::SetupDefaultScreen convention).
+//   3. From main.ras, READ OR WRITE a variable declared here as
+//      "Bobs_varname" (underscore, NOT "Bobs::varname" -- confirmed by the
+//      compiler's own suggested fix: "Could not find variable 'blk_result'.
+//      Did you mean 'Bobs_blk_result'?"). This is the SAME mangled name the
+//      compiler generates internally for every identifier this unit owns.
+//   4. Raw asm("...") text is NOT rewritten by the compiler -- it only
+//      resolves plain Pascal-level references. Any identifier OWNED BY THIS
+//      UNIT that appears inside an asm() string (including this unit's own
+//      locals, not just cross-file ones) must be written using its real
+//      mangled name (e.g. "Bobs_draw_target", not "draw_target") or the
+//      assembler fails with "undefined symbol". This matches how keys.tru
+//      itself writes "Keys_key" (not "key") inside its own asm block.
+//
+// NUM_PLANES/DISPLAY_BITPLANES/ROW_STRIDE below are DUPLICATED from
+// main.ras, not moved -- they're fundamental screen-layout facts the
+// background-drawing code (FastFillBand/BlitFillRect) also depends on, so
+// moving them would mean renaming ~200 unrelated call sites across the rest
+// of the file for no benefit to the bob mechanism itself. Since they are
+// true compile-time consts (never reassigned), two independently-declared
+// copies with the same value carry no runtime risk -- only a manual-sync
+// risk if one is ever changed without the other, same class of risk this
+// project already accepts for gamecode.ras. THE THREE CONST VALUES BELOW
+// MUST BE KEPT IDENTICAL TO main.ras's OWN COPIES.
+//
+// draw_target and bg_pristine, in contrast, ARE genuinely moved (single
+// source of truth here) rather than duplicated -- they're mutable state
+// written by main.ras (FlipBuffer sets draw_target; CaptureBgPristine fills
+// bg_pristine) and read by this unit's own blit/restore procedures, so a
+// duplicate copy would silently diverge. main.ras now reads/writes them as
+// Bobs_draw_target / Bobs_bg_pristine (rule 3 above).
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// TRSE / 68000 COMPILER QUIRKS THIS UNIT WORKS AROUND -- self-contained
+// reference for the "Quirk 1-7" mentions further down. Most were found by
+// direct inspection of the generated 68000 assembly, not guessed from
+// symptoms alone; most are silent (no warning, no assemble-time error)
+// and only produce a visibly wrong result under specific conditions, so
+// casual testing can miss them (Quirk 7 is the exception -- it fails
+// loudly, at compile time).
+//
+// QUIRK 1 -- a pointer expression is only safe with EXACTLY one inline "*"
+// -- not zero, not more than one. Two distinct, confirmed failure modes on
+// either side of that one safe count:
+// (a) ZERO inline multiplications -- a plain "#symbol + variable" addition,
+//     the simplest-LOOKING pointer expression there is -- compiles to a
+//     truncating 16-bit "add.w" after loading the full 32-bit symbol
+//     address, silently dropping any carry into the upper word whenever
+//     the addition overflows the low word. Confirmed via direct assembly
+//     inspection for two unrelated symbol/offset pairs in this codebase's
+//     history (worth treating as a general rule, not a one-off).
+// (b) MORE THAN ONE inline multiplication chained by addition compiles to
+//     a running sum that gets "checkpointed" through a 16-bit "move.w"
+//     between multiplication steps -- which, unlike the add.w case above,
+//     doesn't just drop a carry, it discards the ALREADY-ACCUMULATED upper
+//     word outright, even on terms that had nothing to do with the second
+//     multiplication.
+// Only an expression with EXACTLY one inline multiplication reliably
+// compiles to genuine 32-bit code (mulu.w feeding an add.l). This is
+// deliberately counterintuitive to flag: the plain, multiplication-free
+// addition in (a) looks like the SAFEST possible shape and is actually
+// broken, while adding a multiplication nothing in the logic actually
+// needs can be what makes an expression correct.
+// RULE: don't try to force "exactly one multiplication" by padding an
+// expression with an arbitrary "*1" or similar -- instead precompute the
+// ENTIRE offset into a single plain integer variable first, using ordinary
+// integer arithmetic (unrestricted -- integer math isn't pointer
+// arithmetic and doesn't hit this issue at all, regardless of how many
+// "*" it contains), then hand-roll the final pointer combine in inline asm
+// with an explicit "add.l": load the base via "move.l #symbol,d0" (or the
+// variable holding it), zero-extend the precomputed offset into a second
+// register via "moveq #0,d1 / move.w offsetvar,d1", "add.l d1,d0", then
+// store d0. This sidesteps TRSE's pointer-expression codegen for the
+// risky step entirely and is unconditionally safe regardless of term
+// count or multiplication count on either side of it.
+//
+// QUIRK 2 -- "X<0"/"X>=0" against literal 0 use the wrong (unsigned) branch.
+// "if (X<0) then ..." compiles to a CMP against 0 followed by BHS (Branch
+// if Higher-or-Same), which tests the CARRY flag -- an unsigned
+// comparison. Comparing anything against literal 0 with CMP can never set
+// carry (0 is the unsigned minimum), so BHS is unconditionally taken and
+// the "X<0" branch never actually fires, for any input, ever. The mirror
+// case, "if (X>=0)", compiles to CMP+BLO, which for the same reason is
+// unconditionally taken too -- so that branch always runs regardless of
+// X's real sign. Workaround used throughout this unit: bypass the
+// comparison codegen entirely with a few lines of inline asm that test the
+// sign bit directly via BPL/BMI (which read the N flag -- a true signed
+// test).
+//
+// QUIRK 3 -- a pointer VARIABLE (not a "#symbol") as the base of a 3-term
+// pointer expression ("base + mult + plainvar") makes TRSE emit a
+// truncating 16-bit "add.w" for the final combine, where the IDENTICALLY
+// SHAPED expression with a "#symbol" base correctly emits a full "add.l".
+// Confirmed by diffing the generated assembly for the two cases side by
+// side -- swapping a "#screen"-style base for a "pointer of byte" variable
+// holding that same address was the only difference between a working and
+// a silently-broken build. This is a genuinely separate trigger from
+// Quirk 1 (the expression here has only one inline multiplication, which
+// Quirk 1's own rule says should be safe), not a restatement of it.
+// Workaround: precompute the offset ("mult + plainvar") into its own plain
+// integer first, then hand-roll the final pointer add in inline asm with
+// an explicit "add.l", bypassing the pointer-expression codegen for that
+// one step.
+//
+// QUIRK 3 EXTENDED -- the ZERO-multiplication case ("base + plainvar", no
+// "mult" term at all) is NOT reliably safe either, despite an earlier,
+// now-corrected belief that it was. That belief came from ONE working
+// example (Bobs::BuildBoxMaskInset's own "irp := ispr + ibyteoff", which
+// does compile to a correct "add.l") being generalized into a rule
+// without testing a second one. Writing three MORE procedures using the
+// exact same source-level shape ("ptr := paramptr + offsetvar", parameter
+// base, zero multiplications, one precomputed trailing plain variable)
+// produced THREE DIFFERENT results from the SAME compiler on the SAME
+// shape in the SAME file: one compiled safely (offset zero-extended into
+// a register first, THEN the pointer variable added via "add.l" -- the
+// same order BuildBoxMaskInset's own working example uses), and TWO
+// compiled unsafely (the pointer variable loaded first, then the offset
+// added via a truncating "add.w" -- Quirk 1's failure shape, just with a
+// variable base instead of a "#symbol" one). All three were textually
+// near-identical at the Pascal level; nothing about the source
+// distinguishes the safe one from the unsafe two. CONCLUSION: this shape
+// cannot be judged safe by matching it against any previously-observed
+// working example, including ones in this very file -- Bobs::BuildBoxMask
+// and Bobs::BuildBoxMaskInset's own internal pointer combines use exactly
+// this shape and currently compile safely, but that should be read as
+// "confirmed safe as of the last time each was actually rebuilt and
+// checked," not as a guarantee that holds if either is ever edited.
+// REVISED WORKAROUND, superseding the "precompute the offset, then a
+// plain TRSE pointer-expression add" advice for the zero-multiplication
+// case specifically: don't use a TRSE-level "ptr := paramptr + offset;"
+// assignment at all when the base is a variable. Hand-roll the ENTIRE
+// combine in inline asm instead -- zero-extend the offset into a
+// register ("moveq #0,d0 / move.w offsetvar,d0"), then "add.l
+// paramptr,d0", then store d0 into the destination pointer variable --
+// bypassing TRSE's pointer-expression codegen completely rather than
+// trusting it to pick the same codegen path twice.
+//
+// QUIRK 4 -- "if (CONST=literal)" against a named compile-time const can
+// compile with the comparison elided entirely, unconditionally running the
+// "true" branch regardless of the const's actual declared value. Confirmed
+// by direct inspection of the generated assembly: the "true" block's code
+// appeared as a plain, unconditional fall-through with no CMP/branch
+// instruction anywhere before it, and the "else" block's label was
+// confirmed (via a whole-file search of the generated assembly) to never
+// be referenced by any branch instruction at all -- permanently dead code,
+// unreachable regardless of the const's value. Only reproduced so far for
+// a named "const" compared against a literal; a plain variable compared
+// the same way is NOT affected (forces a genuine runtime comparison).
+// Workaround: any value that will ever be the subject of an "if"
+// comparison should be declared as a plain initialized variable, not a
+// "const" -- e.g. "var MODE:integer = 0;" instead of
+// "const MODE:integer = 0;". A value only ever used as a plain argument
+// (never compared with "if") is unaffected and can stay a real const.
+//
+// QUIRK 5 -- assigning a literal whose high bit is set (i.e. one that
+// reads as NEGATIVE in signed 16-bit, such as $8400 or $FFFE) to a
+// variable, inside an if/then/else branch, can compile as if it were an
+// unsigned byte constant -- without sign-extension. E.g. assigning -2 to
+// an integer variable inside a branch compiled to "move.w #$fe,dest"
+// (storing +254) instead of "move.w #$fffe,dest" (the correct -2).
+// Workaround used in this unit: write such values as raw immediates
+// directly in inline asm rather than through a plain TRSE assignment
+// inside a conditional.
+//
+// QUIRK 6 -- "for X:=A to B do" is a TEST-AFTER (do-while) loop: it always
+// executes the body at least once, with X=A, BEFORE ever checking the
+// bound -- even when B<=A at that point (e.g. a runtime-computed bound of
+// 0, meaning "nothing to iterate"). Confirmed by direct inspection of the
+// generated assembly for a for-loop whose bound was an array read that
+// could legitimately be 0: the compiled shape falls straight from
+// initialization into the loop BODY (no test first), and only AFTER
+// running the body does it increment the counter, compare against the
+// bound, and branch back if not yet equal -- classic do-while structure,
+// not the test-before shape "for X:=A to B do runs X=A..B-1" (this
+// project's own longstanding shorthand for this loop's behavior, still
+// correct for the ordinary B>A case, but incomplete: it doesn't cover
+// what happens when B<=A). This went undiscovered for a long time because
+// every single pre-existing for-loop bound in this codebase -- both
+// compile-time consts (NUM_PLANES, NUM_ENEMIES, etc.) and runtime
+// parameters (e.g. BuildBoxMask's own mhgt/mboxw) -- always happened to
+// be a positive value on every actual call, so the body always needed to
+// run at least once anyway and the missing test-before check never
+// mattered. The failure mode when it DOES matter is severe and silent: an
+// unconditional first iteration processing GARBAGE data (whatever
+// uninitialized memory an index of 0 happens to read, if nothing was ever
+// written there), and if the bound stays fixed at a value the loop
+// counter can never again equal by simple +1 increments (e.g. bound
+// stuck at 0 while the counter counts up from 0), the loop keeps running
+// until the counter's own integer width wraps back around to match it --
+// 65536 iterations for a 16-bit counter, each one whatever the loop body
+// does (a full blitter round-trip in RestoreDirty's own case below,
+// making one call take on the order of seconds and corrupt chip memory
+// at a garbage-derived address on every one of those 65536 passes).
+// Workaround (see RestoreDirty's own fix for a worked example): before
+// any for-loop whose bound could legitimately be 0 at runtime, precompute
+// the bound into a plain variable, then use raw inline asm ("tst.w
+// varname" / "beq SkipLabel") to jump past the ENTIRE for-loop when that
+// variable is zero, landing on a label placed immediately after the
+// loop's closing "end;". Deliberately NOT a TRSE-level "if (bound>0)"
+// guard -- Quirk 2 already established that comparisons against literal 0
+// are a hazard area for this compiler, and TST+BEQ is unambiguous
+// (tests the Z flag directly, no signed/unsigned interpretation involved)
+// regardless of whether that risk turns out to extend to ">0" as well.
+//
+// QUIRK 7 -- a procedure CANNOT call another procedure declared LATER in
+// the same unit/file -- there is no intra-unit forward reference support,
+// despite this project's own main.ras documenting that "TRSE does support
+// forward references" elsewhere. Confirmed by direct test: adding a call
+// to BlitterNastyOn() (declared further down this file) from inside
+// FlipBuffer (declared earlier) failed the headless build outright with
+// "Could not find variable 'Bobs_BlitterNastyOn'" -- the same error shape
+// this file's own header rules (see "cross-file identifier rules" near
+// the top) describe for a genuinely undeclared identifier, not a
+// deferred/forward one. This is scoped to a PLAIN call within the same
+// unit -- it does NOT affect cross-unit calls (main.ras/tutorial.ras
+// calling any Bobs::ProcName works regardless of where in this file that
+// procedure sits, since @use imports the whole unit's declarations at
+// once rather than sequentially) -- so the earlier "forward references
+// work" note was evidently never exercised for THIS specific shape
+// (same-file, procedure-to-later-procedure). Workaround: either declare
+// the callee before the caller (reorder the file), or call it from
+// outside the unit instead (e.g. from the caller's own Main(), the same
+// way BlitterNastyOn is meant to be invoked once at startup anyway).
+// ----------------------------------------------------------------------------
+
+var
+	const NUM_PLANES:integer = 3;
+	const DISPLAY_BITPLANES:integer = 3;
+	const ROW_STRIDE:integer = 40*DISPLAY_BITPLANES;
+
+	bittable : array[8] of byte = (128,64,32,16,8,4,2,1);
+
+	// Moved from main.ras -- single source of truth. main.ras's FlipBuffer
+	// writes this (as Bobs_draw_target) to point at whichever of
+	// #screen/#screen2 is currently the back buffer; every blit procedure
+	// below reads it to know where to draw.
+	draw_target : pointer of byte;
+
+	// Moved from main.ras -- single source of truth. main.ras's
+	// CaptureBgPristine fills this (as Bobs_bg_pristine) once at startup;
+	// RestoreFromPristine/RestoreFromPristinePerPlane below read it every
+	// frame.
+	bg_pristine : array[ROW_STRIDE*256] of byte chipmem;
+
+	// Results of ClampWordCol(): blk_result is the word-aligned byte
+	// column; shift_result (0-15) is how many bits into that word the true
+	// pixel position sits -- used by BlitStampMasked's per-pixel shifted
+	// draw. Restore ignores shift_result (it always wants shift=0: put back
+	// exactly what was captured).
+	blk_result : integer;
+	shift_result : integer;
+
+	// Raster line (VP, 0-255) at which InstallNastyCopper's copper program
+	// hands blitter bus-priority (BLTPRI) FROM the CPU TO the blitter for
+	// the rest of the frame -- see the "Blitter Nasty" section and
+	// InstallNastyCopper's own comment near the end of this file for the
+	// full mechanism.
+	nasty_on_line : integer = 0;
+
+	// Which of FlipBuffer's two given buffers (0=first, 1=second argument)
+	// is currently the BACK buffer -- owned here so FlipBuffer/FlipToBuffer
+	// can be a fully self-contained double-buffering primitive, called as
+	// Bobs::FlipBuffer(#screen, #screen2) with no caller-side bookkeeping
+	// needed beyond that. NOTE: this is a SEPARATE variable from any
+	// caller's own "cur_buf" (e.g. main.ras's own, in the strider project
+	// this unit was extracted from, which still runs its OWN FlipBuffer
+	// with its OWN cur_buf, since it also has to index player/attack
+	// position history that has nothing to do with bobs) -- callers that
+	// need to know which buffer is current for their OWN indexing (e.g.
+	// tutorial.ras's per-buffer bob position history) read it as
+	// Bobs_cur_buf, same as any other variable this unit owns.
+	cur_buf : integer = 1;
+
+	// ------------------------------------------------------------------
+	// Automatic dirty-rect tracking state -- see the section of the same
+	// name, right after RestoreFromPristinePerPlane below, for the full
+	// mechanism, usage sketch, and known limitations. Declared here,
+	// alongside this unit's other state, since TRSE vars all live in one
+	// per-unit var block regardless of which procedure uses them.
+	// ------------------------------------------------------------------
+	const DIRTY_MAX:integer = 16;   // per-buffer capacity; bump if a caller draws more bobs per frame than this
+
+	dirty_blk   : array[2*DIRTY_MAX] of integer;
+	dirty_y     : array[2*DIRTY_MAX] of integer;
+	dirty_ww    : array[2*DIRTY_MAX] of integer;
+	dirty_wh    : array[2*DIRTY_MAX] of integer;
+	dirty_np    : array[2*DIRTY_MAX] of integer;
+	dirty_count : array[2] of integer = (0,0);
+
+// Rounds a pixel-space left edge down to the nearest WORD boundary (even
+// byte column), which the blitter's pointers require. This can land up
+// to 15px left of wpixel_left (vs. up to 7px for plain byte-rounding) --
+// callers must size their sprite/mask buffers wide enough to absorb that
+// (see BuildBoxMask's own sizing note below for the exact rule).
+procedure ClampWordCol(wpixel_left, wwidth_bytes : integer);
+begin
+	blk_result := (wpixel_left >> 4) << 1;
+	shift_result := wpixel_left & 15;
+	// A plain "if (blk_result<0) then blk_result:=0;" hits Quirk 2 above
+	// (see the compiler-quirks reference near the top of this file) --
+	// it would silently never fire, for any input. Bypassed with inline
+	// asm testing the sign bit via BPL instead, which is unaffected by
+	// that bug.
+	// shift_result is reset to 0 in both clamp paths below (here, and in
+	// the right-edge clamp further down) because once either clamp has
+	// overridden blk_result to a forced/pinned column, the true sub-pixel
+	// offset that shift_result would otherwise encode no longer describes
+	// where the blit is actually landing -- leaving it un-reset would feed
+	// BlitStampMasked a shift amount for a position the entity isn't
+	// really at, visibly displaced from where the destination word column
+	// says it should be (e.g. a "teleport" at the screen edge, once
+	// diagnosed).
+	asm("
+		move.w Bobs_blk_result,d0
+		bpl ClampWordColNoNeg
+		moveq #0,d0
+		move.w d0,Bobs_blk_result
+		move.w d0,Bobs_shift_result
+	ClampWordColNoNeg:
+	");
+	if (blk_result>40-wwidth_bytes) then begin
+		blk_result:=40-wwidth_bytes;
+		shift_result:=0;
+	end;
+end;
+
+// Fills a sprite (color/B-channel) buffer with a solid color pattern.
+// REWRITTEN for the interleaved-bitplane layout and the single-blit
+// entity draw (see BlitStampMasked's own rewrite comment for the full
+// mechanism this feeds): instead of NUM_PLANES separate contiguous
+// whole-sprite blocks (one flat run of wbytes*hgt bytes per plane), this
+// now writes hgt REAL rows, and for each row, DISPLAY_BITPLANES separate
+// (wbytes+2)-byte chunks back to back (one per plane, real AND padding --
+// see DISPLAY_BITPLANES's own comment) -- wbytes of real fill value, plus
+// 1 extra WORD (2 bytes) of the SAME fill value as a genuine (not
+// borrowed) barrel-shift lookahead slot. No hidden padding ROW anymore --
+// hgt is now the TRUE row count, not row count+1 -- since every chunk
+// already carries its own lookahead word, nothing needs to borrow from a
+// "next" row/plane the way the old true-planar version did (borrowing
+// across a PLANE boundary here would be actively wrong: two different
+// planes can have different fill values -- see BlitStampMasked's
+// comment).
+// Colors fit a 3-bit budget (0-7) across NUM_PLANES=3 real planes;
+// "(bscolor>>bp)&1" naturally evaluates to 0 for bp>=3, so the padding
+// planes (bp from NUM_PLANES up to DISPLAY_BITPLANES-1) automatically get
+// filled with 0 through this SAME loop, no extra special-casing needed
+// (matches BlitFillRect's identical trick for the background).
+procedure BuildSprite(spr : pointer of byte; wbytes, hgt, bscolor : byte);
+var bp, bk, brow, bcount : integer;
+	// BUG: bval is a 16-bit word, not a byte
+	bval : byte; // Works
+	//bval : integer; // Should work but doesn't
+
+begin
+	bcount := wbytes+2; // real content + 1 lookahead word, per plane per row
+	for brow:=0 to hgt do begin
+		for bp:=0 to DISPLAY_BITPLANES do begin
+			if (((bscolor>>bp)&1)=1) then bval:=255 else bval:=0;
+			for bk:=0 to bcount do begin
+				spr[0] := bval;
+				spr := spr+1;
+			end;
+		end;
+	end;
+end;
+
+// Builds a single-bitplane mask for a debug box outline -- a 1px-thick
+// hollow rectangle, not a solid block. mboxw is the true outline width in
+// pixels, so one procedure can build entities of any box width (e.g. a
+// 32px player/enemy box and a 43px attack box) from the same code. Built
+// bit-by-bit (not byte-by-byte) since mboxw need not be byte-aligned
+// (43 isn't).
+//
+// SIZING mwbytes (the caller's responsibility, not enforced here):
+// mwbytes should be exactly ceil(mboxw/16) WORDS' worth of bytes -- i.e.
+// round mboxw up to the nearest 16px and convert to bytes -- and NOT one
+// word wider than that "just in case". It's tempting to also reserve an
+// extra word here for the barrel shift's lookahead, but that word is
+// already added separately, once, by whichever blit procedure reads this
+// buffer (see BlitStampMasked's mbeffw := mwwords+1), so reserving it
+// again here double-counts it and wastes about 25% of every sprite/mask
+// buffer for nothing. This was gotten wrong once in this project's own
+// history before being corrected -- the derivation, if it needs
+// re-deriving: the box is drawn flush against the buffer's RIGHT edge (at
+// mboxleft = mwbytes*8 - mboxw, computed below), and a blit with a
+// lookahead word already appended is mbeffw=mwwords+1 words wide; shifting
+// right by up to 15 puts the box's last bit at mwbytes*8 + 14 at most,
+// which always fits inside that already-widened blit -- so mwbytes itself
+// only ever needs to satisfy mwbytes*8 >= mboxw, nothing more.
+//
+// Empirically confirmed: the barrel shift delays/pushes content RIGHTWARD
+// as shift_result rises from 0 to 15 -- so all the slack margin belongs on
+// the LEFT, and the real box sits flush against the buffer's right edge
+// (mwbytes*8, the NOMINAL width passed in here -- not the wider +1-word
+// lookahead margin BlitStampMasked reserves internally on top of it).
+// REWRITTEN for the interleaved-bitplane layout (see BuildSprite's own
+// rewrite comment for the matching reasoning on the color/B-channel
+// side). The mask is logically a SINGLE bitplane's worth of shape data,
+// but since the destination screen buffer now walks DISPLAY_BITPLANES
+// chunks per real row in ONE blitter operation (see BlitStampMasked's
+// rewrite -- including the DISPLAY_BITPLANES-vs-NUM_PLANES padding-plane
+// generalization), the mask data has to physically REPEAT once per
+// plane-chunk of the WHOLE row (mrowbytes uses DISPLAY_BITPLANES), not
+// just per real color plane. There's no cheaper way to make one channel
+// re-read the same data once per plane without a modulo that varies
+// mid-blit, which the hardware doesn't support (a channel's modulo is one
+// fixed value for the whole operation). The content-drawing loop itself
+// still only writes the REAL outline into the first NUM_PLANES chunks
+// (mpl:=0 to NUM_PLANES) -- the padding chunks (NUM_PLANES..
+// DISPLAY_BITPLANES-1) are left at 0 by the zero-init loop above, which
+// is exactly what's wanted: mask=0 there makes BlitStampMasked's masked
+// blit a no-op for those sub-rows (D=C, "leave background as-is"), so
+// they never corrupt or need real content. Costs DISPLAY_BITPLANES times
+// the mask memory instead of 1x -- trivial in absolute terms for buffers
+// this small. No hidden padding ROW anymore either, same reasoning as
+// BuildSprite: every chunk already carries its own genuine (not borrowed)
+// lookahead word, so mhgt is the TRUE row count now, not row count+1.
+procedure BuildBoxMask(mspr : pointer of byte; mwbytes, mhgt, mboxw : integer);
+var mrow, mbit, mboxleft, mbyteoff, mzi, mchunk, mrowbytes, mpl : integer; mval : byte; mrp : pointer of byte;
+begin
+	mchunk := mwbytes+2;
+	mrowbytes := mchunk*DISPLAY_BITPLANES;
+	mrp := mspr;
+	for mzi:=0 to mhgt*mrowbytes do begin
+		mrp[0] := 0;
+		mrp := mrp+1;
+	end;
+
+	mboxleft := mwbytes*8 - mboxw;
+
+	for mrow:=0 to mhgt do begin
+		for mbit:=0 to mboxw do begin
+			mval := 0;
+			if (mrow=0) then mval:=1;
+			if (mrow=mhgt-1) then mval:=1;
+			if (mbit=0) then mval:=1;
+			if (mbit=mboxw-1) then mval:=1;
+			if (mval=1) then begin
+				for mpl:=0 to NUM_PLANES do begin
+					mbyteoff := mrow*mrowbytes + mpl*mchunk + ((mboxleft+mbit)>>3);
+					// Confirmed compiling to a safe "add.l" as of this
+					// writing -- but see Quirk 3 EXTENDED (compiler-
+					// quirks reference near the top of this file) before
+					// touching this line: the identical "ptr := paramptr
+					// + offsetvar" shape has been confirmed to ALSO
+					// compile to a truncating "add.w" in other, textually
+					// near-identical procedures. Re-verify against the
+					// compiled assembly if this procedure is ever edited.
+					mrp := mspr + mbyteoff;
+					mrp[0] := mrp[0] | bittable[(mboxleft+mbit)&7];
+				end;
+			end;
+		end;
+	end;
+end;
+
+// Adds a SECOND, inset hollow-rectangle outline on top of an
+// already-built mask -- does NOT clear the buffer first (unlike
+// BuildBoxMask), so call BuildBoxMask for the outer border first, then
+// this for the same mask buffer/dimensions plus a pixel inset. Used to
+// give entities a distinct SHAPE instead of a distinct COLOR. Historical
+// context: an earlier version of BlitStampMasked (see its own comment
+// below for the root cause and fix) had a bug that corrupted the top rows
+// of any entity whose color had a clear bitplane within this project's
+// 3-bit (0-7) color budget, and was invisible only on color 7 (binary
+// "111" -- no clear bitplane to corrupt). While diagnosing it, every
+// entity was temporarily forced onto color 7 to rule color out as a
+// factor -- which suppressed the corruption but also made all entities
+// visually identical, so this inset ring was added as a second,
+// color-independent way to tell them apart while that was true. The
+// corruption itself was later root-caused and fixed for good, so distinct
+// colors are safe again -- but the shape distinction was kept afterward
+// as free, harmless insurance against this class of bug recurring (e.g.
+// with future non-uniform sprite data). The
+// outer silhouette (BuildBoxMask's own border) is left untouched, so the
+// visible bounding box still faithfully matches the entity's real
+// collision hitbox (this is a debug collision-box view -- CheckPlayer/
+// EnemyAttackHits use their own hardcoded pixel offsets, not *_BOX_W, so
+// this is purely cosmetic and never affects gameplay); only an inner ring
+// is added as a decoration.
+// REWRITTEN for the interleaved-bitplane layout -- same DISPLAY_BITPLANES-
+// wide-layout/NUM_PLANES-real-content split as BuildBoxMask above (same
+// mask buffer, same mchunk/mrowbytes-shaped layout, called AFTER
+// BuildBoxMask on it), and same ihgt-is-now-the-true-row-count
+// substitution (no more ireal_h).
+procedure BuildBoxMaskInset(ispr : pointer of byte; iwbytes, ihgt, iboxw, iinset : integer);
+var irow, ibit, iboxleft, ibyteoff, iw, ichunk, irowbytes, ipl : integer; ival : byte; irp : pointer of byte;
+begin
+	ichunk := iwbytes+2;
+	irowbytes := ichunk*DISPLAY_BITPLANES;
+	iboxleft := iwbytes*8 - iboxw;
+	iw := iboxw - iinset*2;
+	for irow:=iinset to ihgt-iinset do begin
+		for ibit:=0 to iw do begin
+			ival := 0;
+			if (irow=iinset) then ival:=1;
+			if (irow=ihgt-iinset-1) then ival:=1;
+			if (ibit=0) then ival:=1;
+			if (ibit=iw-1) then ival:=1;
+			if (ival=1) then begin
+				for ipl:=0 to NUM_PLANES do begin
+					ibyteoff := irow*irowbytes + ipl*ichunk + ((iboxleft+iinset+ibit)>>3);
+					// This is the original example Quirk 3 EXTENDED
+					// (compiler-quirks reference near the top of this
+					// file) was generalized from -- confirmed compiling
+					// to a safe "add.l" as of this writing, but the SAME
+					// shape has ALSO been confirmed to compile to a
+					// truncating "add.w" elsewhere. Re-verify against the
+					// compiled assembly if this procedure is ever edited.
+					irp := ispr + ibyteoff;
+					irp[0] := irp[0] | bittable[(iboxleft+iinset+ibit)&7];
+				end;
+			end;
+		end;
+	end;
+end;
+
+// ============================================================================
+// Real image content + exact-color outlines -- the "framed bob" recipe.
+// Moved here from tutorial.ras (where all three were prototyped and proven
+// live in emulation) once they turned out to be genuinely reusable, not
+// tutorial-specific: extracting a bob's sprite content from a background
+// image instead of a flat BuildSprite fill, filling a solid INSET region of
+// a mask (as opposed to BuildBoxMask's hollow border), and stamping an
+// exact flat color onto a sprite buffer (as opposed to BuildBoxMaskInset's
+// own OR-only approach, which can only ever brighten a color, never hold a
+// plane at exactly 0 against arbitrary background content underneath).
+// Together: a solid center of real image content, shown through a mask
+// inset some margin in from the full box, surrounded by a transparent gap,
+// with the original hollow-box outline drawn on top in a flat, exact color
+// so it reads as a crisp line regardless of what's underneath it.
+// ============================================================================
+
+// Copies a cirwwords-word by cirhgt-row block, starting at pixel
+// (cirsrcx, cirsrcy), from a tightly-packed NUM_PLANES-wide source image
+// (this unit's own row-interleaved convention, no chunk padding -- 40
+// bytes/plane/row, i.e. a 320px-wide source, matching the same assumption
+// Bobs::CopyImageToScreen/Bobs::CaptureBgPristine already make) into a
+// bob-shaped destination sprite buffer (padded per plane-chunk,
+// (cirwwords+1)*2 bytes: real content + 1 lookahead word -- see
+// Bobs::BuildSprite's own declaration comment for that layout). Lets a
+// caller use REAL, non-uniform image content for a bob's sprite instead of
+// Bobs::BuildSprite's uniform solid-color fill -- worth doing specifically
+// because a solid fill is shift-invariant (any barrel-shift read position
+// returns the same byte), so it can never expose BLTCON1's BSH field
+// (channel B's own shift, separate from BLTCON0's ASH which shifts channel
+// A/the mask only -- see Bobs::BlitStampMasked's own comment) being wrong
+// or missing; real, varied content can, since a broken BSH would show up
+// as the visible pattern smearing/misaligning as the bob crosses sub-pixel
+// positions.
+//
+// Copies the FULL (cirwwords+1) words per row/plane, not just cirwwords --
+// the extra word becomes the barrel shifter's own genuine lookahead margin
+// (real continuing image content immediately to the right of the visible
+// area, not zero-fill), matching exactly what Bobs::BlitStampMasked
+// actually reads at runtime.
+//
+// One blitter operation per plane (NUM_PLANES total), not one for the
+// whole buffer: source and destination need DIFFERENT per-row moduli (the
+// source is tightly packed at ROW_STRIDE bytes/row across ALL its planes;
+// the destination's own per-plane chunk is separated from the next row's
+// SAME plane by the OTHER NUM_PLANES-1 chunks in between) -- so this can't
+// use Bobs::BlitStampMasked's single-blit-spans-all-planes trick, which
+// relies on source AND destination sharing the same "plane hop = row hop"
+// symmetry that doesn't hold between these two, differently-shaped
+// buffers.
+//
+// cirsrcx MUST be a multiple of 16 -- this is a plain 2-channel "D=A"
+// blitter copy with no barrel shift, so the source pointer this procedure
+// computes (cirsrcx>>3 bytes into the row) has to already land on a WORD
+// boundary; the blitter's own address pointers are only well-defined on
+// even (word-aligned) addresses. A cirsrcx that's a multiple of 8 but not
+// 16 would compute an ODD byte offset -- an invalid blitter pointer, not
+// merely "off by a pixel" -- and anything not even a multiple of 8 can't
+// be expressed as a byte offset at all without a real barrel-shifted copy,
+// which this procedure doesn't do. cirsrcy has no such constraint (whole
+// rows only).
+//
+// cirsrcptr/cirdstptr are pointer VARIABLES (parameters), not "#symbol"
+// literals. A plain TRSE-level "ptr := paramptr + precomputed_offset;"
+// was tried first here, on the strength of Bobs::BuildBoxMaskInset's own
+// "irp := ispr + ibyteoff" already using that exact shape safely -- but
+// it turned out NOT to be reliable (see Quirk 3 EXTENDED, in the
+// compiler-quirks reference near the top of this file, for the full
+// story: the very same source shape compiled correctly in one of these
+// procedures and silently truncated in two others). Every pointer combine
+// below is hand-rolled in inline asm instead -- zero-extend the offset
+// into a register, then "add.l" the pointer variable -- bypassing TRSE's
+// own pointer-expression codegen entirely rather than trusting it to
+// repeat whichever path it happened to take last time.
+procedure CopyImageRegionToSprite(cirsrcptr, cirdstptr : pointer of byte; cirsrcx, cirsrcy, cirwwords, cirhgt : integer);
+var cirpl, cirsmod, cirdmod, cirsize, cirsoff, cirdoff, cirxbytes, cirrowoff : integer; cirsrc, cirdst : pointer of byte;
+begin
+	cirxbytes := cirsrcx>>3;
+	cirrowoff := cirsrcy*ROW_STRIDE;
+	cirsmod := ROW_STRIDE - (cirwwords+1)*2;
+	cirdmod := (cirwwords+1)*2*(NUM_PLANES-1);
+	cirsize := (cirhgt<<6) | (cirwwords+1);
+	for cirpl:=0 to NUM_PLANES do begin
+		cirsoff := cirpl*40 + cirrowoff + cirxbytes;
+		cirdoff := cirpl*((cirwwords+1)*2);
+		asm("
+			moveq #0,d0
+			move.w Bobs_cirsoff,d0
+			add.l Bobs_cirsrcptr,d0
+			move.l d0,Bobs_cirsrc
+			moveq #0,d0
+			move.w Bobs_cirdoff,d0
+			add.l Bobs_cirdstptr,d0
+			move.l d0,Bobs_cirdst
+		");
+		asm("
+			lea $dff000,a6
+			move.l Bobs_cirsrc,a0
+			move.l Bobs_cirdst,a1
+		CopyImageRegionWait:
+			btst #14,$dff002
+			bne.s CopyImageRegionWait
+			move.l #$ffffffff,BLTAFWM(a6)
+			move.w #$09f0,BLTCON0(a6)
+			move.w #$0,BLTCON1(a6)
+			move.w Bobs_cirsmod,BLTAMOD(a6)
+			move.w Bobs_cirdmod,BLTDMOD(a6)
+			move.l a0,BLTAPTH(a6)
+			move.l a1,BLTDPTH(a6)
+			move.w Bobs_cirsize,BLTSIZE(a6)
+		");
+	end;
+end;
+
+// ORs a solid rectangle -- fsiboxw wide (minus fsiinset margin on each
+// side), fsihgt tall (minus fsiinset margin top/bottom) -- into a mask
+// buffer as opaque. The "solid center" half of the framed-bob recipe:
+// call this INSTEAD of (or, as this section's own header explains, in
+// ADDITION to, for the outline-on-top look) Bobs::BuildBoxMask's own
+// hollow-border fill, to make an inset REGION of the box opaque rather
+// than just its 1px outline.
+//
+// Bit-level, like Bobs::BuildBoxMask itself, not a byte fill -- a non-zero
+// fsiinset generally starts and ends mid-byte, so this walks bit-by-bit
+// the same way Bobs::BuildBoxMask does, just filling the WHOLE inner
+// rectangle instead of only its border. Correctly accounts for
+// fsiboxleft, the same flush-right placement Bobs::BuildBoxMask/
+// Bobs::BuildBoxMaskInset both use (mboxleft/iboxleft there) -- needed for
+// correctness whenever fsiboxw doesn't exactly fill fsiwbytes*8 (e.g. a
+// caller sizing its sprite buffer the standard SPR_WORDS=ceil(BOX_W/16)
+// way for a BOX_W that isn't itself a multiple of 16).
+//
+// Does NOT clear the buffer first (matching Bobs::BuildBoxMaskInset's own
+// convention, not Bobs::BuildBoxMask's) -- call Bobs::BuildBoxMask first
+// if the buffer needs a clean zero-init pass (its own comment explains
+// why that matters: the lookahead byte and any DISPLAY_BITPLANES padding-
+// plane chunks need a real zero, which this procedure never touches).
+// ORs its own bits in, so it's safe to call before OR after
+// Bobs::BuildBoxMaskInset on the same buffer -- OR is commutative,
+// regardless of whether the two shapes' edges happen to coincide.
+procedure FillSolidInsetMask(fsispr : pointer of byte; fsiwbytes, fsihgt, fsiboxw, fsiinset : integer);
+var fsirow, fsibit, fsipl, fsibyteoff, fsichunk, fsirowbytes, fsiboxleft : integer; fsirp : pointer of byte;
+begin
+	fsichunk := fsiwbytes+2;
+	fsirowbytes := fsichunk*NUM_PLANES;
+	fsiboxleft := fsiwbytes*8 - fsiboxw;
+	for fsirow:=fsiinset to fsihgt-fsiinset do begin
+		for fsibit:=fsiinset to fsiboxw-fsiinset do begin
+			for fsipl:=0 to NUM_PLANES do begin
+				fsibyteoff := fsirow*fsirowbytes + fsipl*fsichunk + ((fsiboxleft+fsibit)>>3);
+				asm("
+					moveq #0,d0
+					move.w Bobs_fsibyteoff,d0
+					add.l Bobs_fsispr,d0
+					move.l d0,Bobs_fsirp
+				");
+				fsirp[0] := fsirp[0] | bittable[(fsiboxleft+fsibit)&7];
+			end;
+		end;
+	end;
+end;
+
+// Draws a hollow ring (the SAME shape/geometry Bobs::BuildBoxMaskInset
+// draws -- dcinset=0 is the outer border, matching Bobs::BuildBoxMask's
+// own outline, any larger dcinset an inset ring) onto a SPRITE (color)
+// buffer in an EXACT flat color, not the OR-only approach
+// Bobs::BuildBoxMaskInset itself uses. That distinction matters:
+// Bobs::BuildBoxMaskInset can only ever SET bits, never CLEAR one that
+// existing sprite content (e.g. from Bobs::CopyImageRegionToSprite above)
+// already left set in some plane -- fine only for the one color whose
+// every plane bit happens to already be 1 (NUM_PLANES color budget's own
+// max value), wrong for any other color. This procedure sets dcolor's own
+// bit per plane explicitly (OR where that plane's bit should be 1,
+// AND-NOT where it should be 0), so the outline reads as EXACTLY dcolor
+// regardless of what's underneath, for any dcolor.
+//
+// CHECK YOUR OWN PALETTE before picking dcolor -- don't assume a
+// particular index is white (or any other specific color) without
+// checking: this project's own tutorial got it backwards once, reading a
+// COMPILED-IN DEFAULT/PLACEHOLDER copper palette in the static assembly
+// rather than the REAL palette a caller's own setpalette() call loads at
+// runtime from its actual source data -- confirm against the real
+// palette bytes (or the runtime-loaded values), not the compiled binary's
+// own placeholder defaults, which are never what actually gets displayed
+// once setpalette() overwrites them.
+//
+// Call this AFTER filling the sprite's own background content (e.g.
+// Bobs::CopyImageRegionToSprite above) -- these rings are meant to be
+// drawn "on top", so they read as a crisp, exact color regardless of what
+// content is underneath, not the other way around.
+//
+// BBUSY WAIT, FIRST THING, before any of the writes below -- this
+// procedure is pure CPU (plain byte writes, no blitter operation of its
+// own), and every blit-triggering procedure in this unit waits for BBUSY
+// BEFORE its own next blit, never AFTER its own last one (e.g.
+// Bobs::CopyImageRegionToSprite above, whose own last blit is triggered
+// and left running when it returns) -- safe only as long as whatever
+// runs next is itself blitter-aware, so its own leading BBUSY check
+// naturally serializes against the still-running blit. A caller of THIS
+// procedure right after a blit-triggering one (its own most likely use,
+// per this section's own header) would break that assumption without
+// this wait: it would start writing over the SAME buffer the blitter
+// might still be mid-DMA on. Checking here, rather than leaving it to
+// every future caller to remember, means this procedure is safe to call
+// immediately after any blit-triggering one regardless.
+procedure DrawColorRingOnSprite(dcspr : pointer of byte; dcwbytes, dchgt, dcboxw, dcinset, dcolor : integer);
+var dcrow, dcbit, dcpl, dcw, dcboxleft, dcval, dcbyteoff, dcplbit, dcbitidx, dcchunk, dcrowbytes : integer; dcrp : pointer of byte;
+begin
+	asm("
+		DrawColorRingBlitWait:
+		btst #14,$dff002
+		bne.s DrawColorRingBlitWait
+	");
+	dcchunk := dcwbytes+2;
+	dcrowbytes := dcchunk*NUM_PLANES;
+	dcboxleft := dcwbytes*8 - dcboxw;
+	dcw := dcboxw - dcinset*2;
+	for dcrow:=dcinset to dchgt-dcinset do begin
+		for dcbit:=0 to dcw do begin
+			dcval := 0;
+			if (dcrow=dcinset) then dcval:=1;
+			if (dcrow=dchgt-dcinset-1) then dcval:=1;
+			if (dcbit=0) then dcval:=1;
+			if (dcbit=dcw-1) then dcval:=1;
+			if (dcval=1) then begin
+				dcbitidx := (dcboxleft+dcinset+dcbit)&7;
+				for dcpl:=0 to NUM_PLANES do begin
+					dcbyteoff := dcrow*dcrowbytes + dcpl*dcchunk + ((dcboxleft+dcinset+dcbit)>>3);
+					asm("
+						moveq #0,d0
+						move.w Bobs_dcbyteoff,d0
+						add.l Bobs_dcspr,d0
+						move.l d0,Bobs_dcrp
+					");
+					dcplbit := (dcolor>>dcpl)&1;
+					if (dcplbit=1) then dcrp[0] := dcrp[0] | bittable[dcbitidx]
+					else dcrp[0] := dcrp[0] & (255-bittable[dcbitidx]);
+				end;
+			end;
+		end;
+	end;
+end;
+
+// Masked blit: real (non-rectangular) sprite drawing, combined with the
+// barrel shifter for true per-pixel x-positioning. Uses all four
+// blitter channels -- A = mask, B = color data, C = destination readback
+// (so the blitter can see what is already on screen), D = destination
+// write. Minterm $CA implements D = (A AND B) OR (NOT A AND C): where the
+// mask is opaque (1), take the sprite's own color bit; where it's
+// transparent (0), keep whatever background was already there -- the
+// standard Amiga "cookie cutter" masked-sprite technique. ASH (in mcon0)
+// and BSH (in mcon1) shift A and B together, so mask and image stay
+// pixel-aligned as they move.
+//
+// REWRITTEN for the interleaved-bitplane layout: this used to loop 3
+// times (once per plane), each iteration a full BLTSIZE-triggered
+// blitter operation with its own BBUSY wait and register reload. Now
+// it's ONE blitter operation for the WHOLE multi-plane entity -- this is
+// the actual point of the interleaved rewrite. It follows up on an
+// earlier experiment with a synthetic "wide enemy" test entity: 3x the
+// normal width but touching only 1 bitplane instead of 3, so a single
+// instance's one blitter operation moved exactly as much data as 3
+// normal (3-plane) entities combined. Comparing "3x data, 1 operation"
+// against "1x data, 3 operations" showed the former reliably supports
+// more simultaneous on-screen objects for the same total bytes moved --
+// confirming the win comes from fewer per-operation setups (register
+// pokes, the BBUSY wait, procedure-call overhead), not from the
+// underlying data-movement cost, which is fixed per word regardless of
+// layout. This rewrite generalizes that same win to the real gameplay
+// entities instead of a synthetic test one.
+//
+// Mechanism: BLTSIZE's height field now counts mwhgt*DISPLAY_BITPLANES
+// "sub-rows" -- NOT mwhgt*NUM_PLANES -- each sub-row is exactly one
+// plane's worth of one real row (mbeffw words wide, the same "+1
+// lookahead word" margin as before). Walking forward by mcdmod bytes
+// after every sub-row on the C/D (screen) side ALWAYS lands on the same
+// destination column, whether the next sub-row is the next plane of the
+// SAME real row or plane 0 of the NEXT real row -- both are just "skip to
+// the start of the next 40-byte block" hops in this layout, since planes
+// are stored back-to-back per row with no gaps (see NUM_PLANES/
+// ROW_STRIDE's own comments). That symmetry is what makes a single fixed
+// modulo correct across the whole multi-plane, multi-row operation, with
+// the SAME mcdmod formula (40 - mbeffw*2) this procedure already used
+// per-plane before the rewrite -- BUT it only holds if the blit walks
+// through EVERY block the real row actually contains, including
+// DISPLAY_BITPLANES's "extra" padding planes beyond our own NUM_PLANES
+// color budget; stopping at NUM_PLANES sub-rows per row would jump
+// straight into the middle of the padding planes instead of the next
+// row's plane 0 the moment DISPLAY_BITPLANES > NUM_PLANES. The mask (A)
+// channel being 0 for those padding sub-rows (see BuildBoxMask's own
+// rewrite comment) is what makes walking through them harmless: D=(A AND
+// B) OR (NOT A AND C) with A=0 reduces to D=C, a no-op that leaves
+// whatever's already in that (always-zero, never-drawn-to) padding plane
+// untouched.
+//
+// The mask (A) and sprite (B) source buffers are built to match this
+// same per-sub-row cadence directly (see BuildSprite/BuildBoxMask's own
+// rewrite comments) -- both are walked with modulo 0 (tightly packed),
+// no AMOD/BMOD rewind trick needed at all anymore: every sub-row already
+// carries its own genuine lookahead word (not borrowed from a neighbour,
+// which would be WRONG here since neighbouring sub-rows can be different
+// PLANES with different fill values -- unlike the old true-planar
+// version, where "the next row" always meant the next row of the SAME
+// plane, making the borrow safe). There's no more "true last row" special
+// case either, since nothing borrows across a boundary in the first
+// place.
+//
+// Historical note on why this procedure always uses the wide (mbeffw =
+// mwwords+1) buffer width and the modulo-0 tightly-packed reads above,
+// with no shortcut for mdshift=0: an earlier, pre-rewrite version of this
+// same masked+shifted blit special-cased mdshift=0 as an optimization --
+// "no shift means no lookahead word needed" -- using a narrower buffer
+// width and no modulo rewind. That shortcut is safe for a plain 2-channel
+// copy (still used by the restore procedures below, at shift=0 always),
+// but was NOT safe for this 4-channel cookie-cut blit: it corrupted the
+// top rows of the sprite every time an entity's x-position crossed an
+// exact 16-pixel boundary (mdshift naturally hits exactly 0 there during
+// ordinary movement, not just at screen edges). Root-caused by forcing
+// the shift value to specific literals one at a time and observing that
+// every value which took the "assume real shifting" (wide/rewind) code
+// path rendered cleanly, while only the value that took the narrow/
+// no-rewind shortcut glitched -- confirming the shortcut itself, not the
+// shift value, was the bug. Fixed by removing the special case entirely.
+// This rewritten, single-blit design has no narrow/wide shortcut branch
+// left at all to accidentally reintroduce that class of bug.
+//
+// draw_target holds #screen or #screen2 (see its own declaration comment
+// above) -- reading/writing it as "Bobs_draw_target" inside the asm block
+// below per this unit's own cross-file rules (see this file's header
+// comment). Its use here as a pointer VARIABLE, rather than a "#symbol",
+// is exactly Quirk 3 in the compiler-quirks reference near the top of
+// this file: precompute the offset as a plain integer (mdstoff below),
+// then hand-roll the final pointer add in asm with an explicit add.l.
+procedure BlitStampMasked(mdst_bx, mdst_by, mwwords, mwhgt, mdshift : integer; wmask, mwspr : pointer of byte);
+var mcdmod, msize, mcon0, mcon1, mbeffw, mdstoff : integer;
+var masrc, mbsrc, mcdst, mddst : pointer of byte;
+begin
+	mbeffw := mwwords+1;
+	mcdmod := 40 - mbeffw*2;
+	msize := ((mwhgt*DISPLAY_BITPLANES)<<6) | mbeffw;
+	mcon0 := ((mdshift << 8) << 4) | $0FCA;
+	// BSH (channel B's own shift field, BLTCON1 bits 15-12) must be set
+	// alongside ASH (mcon0's own shift field, which only shifts channel
+	// A/the mask) -- otherwise channel B's color data stays word-aligned
+	// while the mask moves to the true sub-pixel position, desyncing mask
+	// and color data by up to 15px. This is invisible whenever the sprite
+	// buffer is filled with a uniform value throughout (as BuildSprite's
+	// solid-color fill does today) -- any read position within a uniform
+	// buffer gives the same value regardless of shift -- but it becomes a
+	// real, visible bug the moment non-uniform (real pixel-art) sprite
+	// data replaces a uniform placeholder fill.
+	mcon1 := (mdshift << 8) << 4;
+	masrc := wmask;
+	mbsrc := mwspr;
+	mdstoff := mdst_by*ROW_STRIDE + mdst_bx;
+	asm("
+		move.l Bobs_draw_target,d0
+		moveq #0,d1
+		move.w Bobs_mdstoff,d1
+		add.l d1,d0
+		move.l d0,Bobs_mcdst
+	");
+	mddst := mcdst;
+	asm("
+		lea $dff000,a6
+		move.l Bobs_masrc,a0
+		move.l Bobs_mbsrc,a1
+		move.l Bobs_mcdst,a2
+		move.l Bobs_mddst,a3
+	MaskBlitWait:
+		btst #14,$dff002
+		bne.s MaskBlitWait
+		move.l #$ffffffff,BLTAFWM(a6)
+		move.w Bobs_mcon0,BLTCON0(a6)
+		move.w Bobs_mcon1,BLTCON1(a6)
+		move.w #$0,BLTAMOD(a6)
+		move.w #$0,BLTBMOD(a6)
+		move.w Bobs_mcdmod,BLTCMOD(a6)
+		move.w Bobs_mcdmod,BLTDMOD(a6)
+		move.l a0,BLTAPTH(a6)
+		move.l a1,BLTBPTH(a6)
+		move.l a2,BLTCPTH(a6)
+		move.l a3,BLTDPTH(a6)
+		move.w Bobs_msize,BLTSIZE(a6)
+	");
+end;
+
+// ALTERNATE entity draw. This unit doesn't dispatch between this and
+// BlitStampMasked itself -- callers pick whichever one they want at each
+// call site, e.g. via their own dispatch flag declared as a plain
+// variable rather than a "const" (see Quirk 4 in the compiler-quirks
+// reference near the top of this file for why a const-based mode switch
+// is unsafe). Reach for this procedure instead of BlitStampMasked above
+// when
+// DISPLAY_BITPLANES > NUM_PLANES is actually wanted for real (more total
+// on-screen colors, not just a quick DMA-cost benchmark): BlitStampMasked
+// is fast BUT pays for walking DISPLAY_BITPLANES sub-rows per real row,
+// including the always-empty padding ones (needed to keep its single
+// fixed modulo valid across both plane and row boundaries -- see its own
+// comment). This procedure instead does NUM_PLANES SEPARATE blitter
+// operations, one per REAL plane, each spanning all mwhgt rows with its
+// OWN modulo (ROW_STRIDE - mbeffw*2) that skips straight from one row's
+// plane p to the NEXT row's SAME plane p, jumping over however many other
+// planes (real or padding) sit in between in a single hop -- indifferent
+// to DISPLAY_BITPLANES's value, since ROW_STRIDE already accounts for it.
+// This is structurally the SAME technique BlitStamp/the old true-planar
+// BlitStampMasked always used, just with ROW_STRIDE-relative addressing
+// instead of PLANE_SIZE-relative. Reads the SAME mask/sprite buffers as
+// BlitStampMasked (no separate buffers needed): both were already laid
+// out with DISPLAY_BITPLANES chunks per row (see BuildSprite/BuildBoxMask),
+// so picking out just plane mpl's chunk from each row and skipping the
+// rest is exactly what this procedure's own AMOD/BMOD (mrowbytes-mchunk)
+// does. Costs NUM_PLANES separate BBUSY-wait+register-set+trigger
+// sequences per entity (matching this project's ORIGINAL pre-single-blit
+// cost) -- slower than BlitStampMasked at DISPLAY_BITPLANES=NUM_PLANES,
+// which is exactly why it's not the default; but its total blitter data
+// moved per entity is INDEPENDENT of DISPLAY_BITPLANES, unlike
+// BlitStampMasked's, so it's the one to reach for once DISPLAY_BITPLANES
+// is being raised for real extra on-screen colors rather than as a
+// temporary DMA-cost probe.
+// NOTE: parameters are all "pp"-prefixed and distinct from BlitStampMasked's
+// own (mdst_bx/mdst_by/etc.). TRSE gives every identifier in a program a
+// single fixed memory address -- there is no real per-procedure scoping,
+// only a parse-time check for outright duplicate declarations -- so a
+// PARAMETER name is just as global as a top-level variable name, and every
+// identifier in the whole program (loop counters, parameter names, locals)
+// must be unique. Reusing BlitStampMasked's exact parameter names here
+// failed the build outright ("Variable 'mdst_bx' is already defined!"),
+// not just a style choice.
+procedure BlitStampMaskedPerPlane(ppdst_bx, ppdst_by, ppwwords, ppwhgt, ppdshift : integer; ppwmask, ppwspr : pointer of byte);
+var ppabmod, ppcdmod, ppsize, pprowoff, ppcon0, ppcon1, ppbeffw, ppchunk, pprowbytes, ppl, ppdstoff : integer;
+var ppasrc, ppbsrc, ppcdst, ppddst : pointer of byte;
+begin
+	ppbeffw := ppwwords+1;
+	ppchunk := ppbeffw*2;
+	pprowbytes := ppchunk*DISPLAY_BITPLANES;
+	// A/B (mask/sprite) modulo: skip the OTHER DISPLAY_BITPLANES-1 chunks
+	// in this row to land on the SAME plane's chunk in the next row --
+	// same "whole row stride minus this chunk's own width" shape as the
+	// C/D modulo below, just measured against the mask/sprite buffer's
+	// own row width (pprowbytes) instead of the real screen's (ROW_STRIDE).
+	ppabmod := pprowbytes - ppchunk;
+	ppcdmod := ROW_STRIDE - ppchunk;
+	ppsize := (ppwhgt<<6) | ppbeffw;
+	ppcon0 := ((ppdshift << 8) << 4) | $0FCA;
+	ppcon1 := (ppdshift << 8) << 4;
+	// Precomputed once, reused per plane below -- can't just be inlined as
+	// a 3rd term alongside "ppl*40" (that would be two inline
+	// multiplications in one pointer expression, exactly the shape Quirk 1
+	// in the compiler-quirks reference near the top of this file confirms
+	// unsafe).
+	pprowoff := ppdst_by*ROW_STRIDE + ppdst_bx;
+	for ppl:=0 to NUM_PLANES do begin
+		// "ppwmask + ppl*ppchunk" -- a 2-term expression, base plus ONE
+		// inline multiplication, nothing else -- matches the proven-safe
+		// 2-term "BASE + mult" shape (e.g. CaptureBgPristine's own
+		// "cscreen + 40*cppl", further down in this same file).
+		ppasrc := ppwmask + ppl*ppchunk;
+		ppbsrc := ppwspr + ppl*ppchunk;
+		ppdstoff := ppl*40 + pprowoff;
+		asm("
+			move.l Bobs_draw_target,d0
+			moveq #0,d1
+			move.w Bobs_ppdstoff,d1
+			add.l d1,d0
+			move.l d0,Bobs_ppcdst
+		");
+		ppddst := ppcdst;
+		asm("
+			lea $dff000,a6
+			move.l Bobs_ppasrc,a0
+			move.l Bobs_ppbsrc,a1
+			move.l Bobs_ppcdst,a2
+			move.l Bobs_ppddst,a3
+		MaskBlitPPWait:
+			btst #14,$dff002
+			bne.s MaskBlitPPWait
+			move.l #$ffffffff,BLTAFWM(a6)
+			move.w Bobs_ppcon0,BLTCON0(a6)
+			move.w Bobs_ppcon1,BLTCON1(a6)
+			move.w Bobs_ppabmod,BLTAMOD(a6)
+			move.w Bobs_ppabmod,BLTBMOD(a6)
+			move.w Bobs_ppcdmod,BLTCMOD(a6)
+			move.w Bobs_ppcdmod,BLTDMOD(a6)
+			move.l a0,BLTAPTH(a6)
+			move.l a1,BLTBPTH(a6)
+			move.l a2,BLTCPTH(a6)
+			move.l a3,BLTDPTH(a6)
+			move.w Bobs_ppsize,BLTSIZE(a6)
+		");
+	end;
+end;
+
+// Restores a rectangle directly from bg_pristine to the screen -- both
+// sides are "screen-shaped" (real ROW_STRIDE-wide rows), so BOTH channels
+// need the SAME modulo here. This is what lets the per-frame Save phase
+// stay gone by default: bg_pristine is always correct for any position,
+// so there's nothing to snapshot each frame -- restore just pulls
+// straight from it using the entity's OLD position, same as always.
+// Always shift=0 (restoring wants back exactly the true background, no
+// repositioning), so no beffw/BLTAMOD-rewind branching is needed at all.
+//
+// REWRITTEN for the interleaved-bitplane layout -- same "one blit instead
+// of nplanes" mechanism as BlitStampMasked's own rewrite (see its comment
+// for the full reasoning), but simpler here since restoring is a plain
+// 2-channel "D=A" copy (no mask/shift), and both sides (screen and
+// bg_pristine) share the IDENTICAL interleaved layout, so both use the
+// SAME modulo. Call sites pass nplanes=DISPLAY_BITPLANES (not a hardcoded
+// 3) -- same DISPLAY_BITPLANES-vs-NUM_PLANES padding-plane reasoning as
+// BlitStampMasked: restore must walk through every plane the masked
+// draw's single blit did, real or padding, for the row-vs-plane modulo
+// symmetry to hold. nplanes is now a height MULTIPLIER instead of a loop
+// bound, but the parameter's job (how many plane-chunks per real row)
+// means exactly the same thing either way.
+procedure RestoreFromPristine(dst_bx, dst_by, wwords, whgt, nplanes : integer);
+var prmod, prsize, prdstoff : integer; prsrc, prdst : pointer of byte;
+begin
+	prmod := 40 - wwords*2;
+	prsize := ((whgt*nplanes)<<6) | wwords;
+	// #bg_pristine is now this unit's own array (see this file's header
+	// comment) -- referenced bare, no "Bobs_" prefix needed, since this is
+	// plain Pascal-level code (not raw asm) inside the SAME unit that owns
+	// it.
+	prsrc := #bg_pristine + dst_by*ROW_STRIDE + dst_bx;
+	prdstoff := dst_by*ROW_STRIDE + dst_bx;
+	asm("
+		move.l Bobs_draw_target,d0
+		moveq #0,d1
+		move.w Bobs_prdstoff,d1
+		add.l d1,d0
+		move.l d0,Bobs_prdst
+	");
+	asm("
+		lea $dff000,a6
+		move.l Bobs_prsrc,a0
+		move.l Bobs_prdst,a1
+	RestorePristineWait:
+		btst #14,$dff002
+		bne.s RestorePristineWait
+		move.l #$ffffffff,BLTAFWM(a6)
+		move.w #$09f0,BLTCON0(a6)
+		move.w #$0,BLTCON1(a6)
+		move.w Bobs_prmod,BLTAMOD(a6)
+		move.w Bobs_prmod,BLTDMOD(a6)
+		move.l a0,BLTAPTH(a6)
+		move.l a1,BLTDPTH(a6)
+		move.w Bobs_prsize,BLTSIZE(a6)
+	");
+end;
+
+// ALTERNATE restore, paired with BlitStampMaskedPerPlane above -- selected
+// the same way, via ENTITY_BLIT_MODE. Same reasoning as that procedure:
+// NUM_PLANES separate 2-channel copies (one per REAL plane), each using
+// modulo (ROW_STRIDE - wwords*2) to skip straight to the next row of the
+// SAME plane, indifferent to how many padding planes DISPLAY_BITPLANES
+// adds in between. No "nplanes" parameter needed (unlike
+// RestoreFromPristine) since it's always exactly NUM_PLANES separate
+// operations here, never DISPLAY_BITPLANES-many.
+// NOTE: parameters are "rpp"-prefixed, distinct from RestoreFromPristine's
+// own (dst_bx/dst_by/wwords/whgt) -- see BlitStampMaskedPerPlane's own
+// comment: TRSE doesn't scope parameter names per procedure, so reusing
+// those exact names here fails the build the same way theirs did.
+procedure RestoreFromPristinePerPlane(rppdst_bx, rppdst_by, rppwwords, rppwhgt : integer);
+var rppmod, rppsize, rprowoff, rppl, rppdstoff : integer; rppsrc, rppdst : pointer of byte;
+begin
+	rppmod := ROW_STRIDE - rppwwords*2;
+	rppsize := (rppwhgt<<6) | rppwwords;
+	rprowoff := rppdst_by*ROW_STRIDE + rppdst_bx;
+	for rppl:=0 to NUM_PLANES do begin
+		rppsrc := #bg_pristine + rppl*40 + rprowoff;
+		rppdstoff := rppl*40 + rprowoff;
+		asm("
+			move.l Bobs_draw_target,d0
+			moveq #0,d1
+			move.w Bobs_rppdstoff,d1
+			add.l d1,d0
+			move.l d0,Bobs_rppdst
+		");
+		asm("
+			lea $dff000,a6
+			move.l Bobs_rppsrc,a0
+			move.l Bobs_rppdst,a1
+		RestorePristinePPWait:
+			btst #14,$dff002
+			bne.s RestorePristinePPWait
+			move.l #$ffffffff,BLTAFWM(a6)
+			move.w #$09f0,BLTCON0(a6)
+			move.w #$0,BLTCON1(a6)
+			move.w Bobs_rppmod,BLTAMOD(a6)
+			move.w Bobs_rppmod,BLTDMOD(a6)
+			move.l a0,BLTAPTH(a6)
+			move.l a1,BLTDPTH(a6)
+			move.w Bobs_rppsize,BLTSIZE(a6)
+		");
+	end;
+end;
+
+// ============================================================================
+// Automatic dirty-rect tracking -- EXPERIMENTAL, OPT-IN, ADDITIVE ONLY.
+//
+// UNTESTED IN EMULATION as of this writing: confirmed to compile cleanly
+// (headless CLI build) and every call site below was hand-checked against
+// its callee's real parameter order/count, but neither main.ras nor
+// tutorial.ras calls any procedure in this section, so nothing has
+// actually exercised it against real screen/blitter state yet. Wire it
+// into a real caller (see the usage sketch below) and confirm bobs drawn
+// this way actually erase correctly frame to frame before relying on it
+// for anything real.
+//
+// Every draw/restore procedure above (BlitStampMasked, RestoreFromPristine,
+// etc.) is UNCHANGED by this section -- nothing here alters their behavior
+// or signature. This is a second, parallel way to drive them: instead of a
+// caller hand-maintaining its own per-buffer position history (the
+// buf_bx/buf_by/buf_b_alive-shaped arrays main.ras and tutorial.ras each
+// declare and update themselves, one entry per bob per buffer, plus their
+// own SaveBufferPositions-style procedure), this unit can track "what got
+// drawn into which buffer, and where" automatically, and hand it straight
+// back for restoring -- no caller-side bookkeeping, no fixed-size per-bob
+// history arrays.
+//
+// MECHANISM: two per-buffer lists (buf id 0 and 1, matching the convention
+// every double-buffering piece in this unit already uses), each a plain
+// fixed-capacity array acting as a growable list at runtime -- TRSE has no
+// heap/dynamic allocation to reach for here, so DIRTY_MAX (see its own
+// declaration comment above) is a hard cap, not a soft one; see "known
+// limitations" below. Drawing a bob via BlitStampMaskedTracked (instead of
+// calling BlitStampMasked directly) both draws it AND appends its
+// destination rectangle to that buffer's list. RestoreDirty(buf id) walks
+// the WHOLE list for that buffer, restores every rectangle in it from
+// bg_pristine, then empties the list -- so the next frame's draws start
+// building a fresh list from nothing. Under double buffering, that means:
+// RestoreDirty at the top of a frame always restores exactly what THIS
+// SAME buffer had drawn on it the last time it was the back buffer (two
+// frames ago), because nothing else clears or touches the list in between.
+//
+// USAGE SKETCH -- replaces a caller's own Restore/Update/Draw/Save block.
+// Neither main.ras nor tutorial.ras has been converted to this; both keep
+// their existing hand-rolled history arrays unchanged for now, per the
+// "old functions stay as they are" intent behind keeping this additive:
+//   interrupt VBlank();
+//   begin
+//       Bobs::RestoreDirty(Bobs_cur_buf);   // undo last frame's draws into THIS buffer
+//       UpdateBobs();
+//       for i:=0 to NUM_BOBS do begin
+//           Bobs::ClampWordCol(bx[i]-BOB_BOX_LEFT, (BOB_SPR_WORDS+1)*2);
+//           Bobs::BlitStampMaskedTracked(Bobs_cur_buf, Bobs_blk_result, by[i]-64,
+//               BOB_SPR_WORDS, BOB_SPR_H, Bobs_shift_result, #bob_mask, #bob_sprite);
+//       end;
+//       Bobs::FlipBuffer(#screen, #screen2);
+//   end;
+// No buf_bx/buf_by/buf_b_alive arrays, no SaveBufferPositions call, no
+// per-bob "which buffer, which slot" indexing -- the list already knows.
+//
+// WHY THE OLD (MANUAL-HISTORY) APPROACH STAYS THE DEFAULT, NOT REPLACED:
+// this trades a small, fixed amount of per-bob overhead (two array writes
+// per draw call to append; a loop plus an extra procedure-call layer per
+// restored rectangle, instead of the caller's own tight, already-open-
+// coded loop) for not having to hand-maintain position history at all.
+// Whether that trade is worth it depends on how many bobs a given caller
+// draws per frame and how tight its own frame budget already is -- exactly
+// the kind of thing this project's own history of bandwidth-vs-overhead
+// measurements says needs measuring on real hardware/emulation, not
+// assumed. Both mechanisms coexist so that trade can actually be measured,
+// caller by caller, rather than picked once for everyone. NOT YET
+// MEASURED as of this writing.
+//
+// LIMITATIONS of this first pass, deliberately not addressed yet:
+// - Covers only the default single-blit path (BlitStampMasked/
+//   RestoreFromPristine). BlitStampMaskedPerPlane/
+//   RestoreFromPristinePerPlane (the ENTITY_BLIT_MODE=1-equivalent
+//   alternate technique) have no "*Tracked" counterpart yet -- add one the
+//   same way (call the PerPlane draw, then MarkDirty) if that path needs
+//   this too.
+// - DIRTY_MAX is a hard per-buffer cap, checked at MarkDirty time
+//   (silently drops the record if already full -- see its own comment). A
+//   caller that draws more than DIRTY_MAX bobs into one buffer in a single
+//   frame will have some of them never auto-restored. Bump DIRTY_MAX (its
+//   declaration, near the top of this file) if that happens; there is no
+//   dynamic growth to fall back on.
+// - No de-duplication or merging: drawing the same bob (or overlapping
+//   bobs) more than once before the next RestoreDirty records -- and later
+//   restores -- every individual rectangle, even if they overlap. Harmless
+//   (restoring the same pixels twice is a no-op, just wasted blitter
+//   cycles), not incorrect.
+// ============================================================================
+
+// Appends one destination rectangle to mdbuf's dirty list. Called by
+// BlitStampMaskedTracked below right after drawing -- not usually called
+// directly, but exposed in case a caller wants to draw with plain
+// BlitStampMasked (e.g. to reuse an existing call site unchanged) and only
+// add tracking as a separate second step.
+//
+// Silently does nothing once dirty_count[mdbuf] reaches DIRTY_MAX, rather
+// than overflowing the array -- see this section's own "known
+// limitations" note above. The comparison is against a positive constant
+// (DIRTY_MAX) and a runtime array read, not literal 0 on either side, so
+// this isn't the unsigned-branch shape Quirk 2 (compiler-quirks reference
+// near the top of this file) warns about.
+procedure MarkDirty(mdbuf, mdblk, mdy, mdww, mdwh, mdnp : integer);
+var mdslot : integer;
+begin
+	if (dirty_count[mdbuf] < DIRTY_MAX) then begin
+		mdslot := mdbuf*DIRTY_MAX + dirty_count[mdbuf];
+		dirty_blk[mdslot] := mdblk;
+		dirty_y[mdslot] := mdy;
+		dirty_ww[mdslot] := mdww;
+		dirty_wh[mdslot] := mdwh;
+		dirty_np[mdslot] := mdnp;
+		dirty_count[mdbuf] := dirty_count[mdbuf] + 1;
+	end;
+end;
+
+// Draws exactly as BlitStampMasked does (calls it directly, unchanged,
+// with the SAME tkwwords a direct BlitStampMasked call would take), then
+// records the drawn rectangle in tkbuf's dirty list via MarkDirty -- the
+// "automatic" half of this section's mechanism. DISPLAY_BITPLANES is
+// passed to MarkDirty as the plane count, matching what RestoreFromPristine's
+// own nplanes parameter expects when restoring this same rectangle later
+// (see BlitStampMasked's own comment for why the draw and its later
+// restore must walk the same plane count).
+//
+// WIDTH NOTE, easy to get wrong and worth spelling out: BlitStampMasked
+// widens tkwwords by one word internally for its own blit (mbeffw :=
+// mwwords+1, its own comment above has the full reasoning), but
+// RestoreFromPristine does NOT do any such widening itself -- its own
+// wwords parameter is used as the literal blit width, so a caller of
+// RestoreFromPristine directly has always had to pass the ALREADY-widened
+// value (e.g. this file's own tutorial usage sketch passes BOB_SPR_WORDS+1,
+// not BOB_SPR_WORDS). MarkDirty therefore records tkwwords+1 here, not
+// tkwwords -- recording the raw, unwidened value would make RestoreDirty's
+// later restore one word narrower than the actual drawn footprint,
+// leaving an unerased sliver at the shifted edge nearly every frame. This
+// was caught by hand-deriving it against RestoreFromPristine's own
+// (whgt*nplanes)<<6 | wwords line, not by symptom -- if this mechanism is
+// ever extended (e.g. a *PerPlane tracked variant), re-derive the correct
+// width the same way rather than assuming symmetry with the draw side.
+// NOTE: parameters are "tk"-prefixed, distinct from BlitStampMasked's own
+// (mdst_bx/etc.) and from MarkDirty's own (mdbuf/etc.) -- TRSE doesn't
+// scope identifiers per procedure (see BlitStampMaskedPerPlane's own
+// comment for the full reasoning), so every procedure in this file needs
+// its own distinct parameter names.
+procedure BlitStampMaskedTracked(tkbuf, tkdst_bx, tkdst_by, tkwwords, tkwhgt, tkdshift : integer; tkwmask, tkwspr : pointer of byte);
+begin
+	BlitStampMasked(tkdst_bx, tkdst_by, tkwwords, tkwhgt, tkdshift, tkwmask, tkwspr);
+	MarkDirty(tkbuf, tkdst_bx, tkdst_by, tkwwords+1, tkwhgt, DISPLAY_BITPLANES);
+end;
+
+// Restores every rectangle recorded in rdbuf's dirty list (via
+// RestoreFromPristine, one call per rectangle), then empties the list --
+// this IS the "cleared out on the next buffer restore" behavior: once
+// this returns, rdbuf's list has nothing in it until this frame's own
+// BlitStampMaskedTracked calls repopulate it.
+//
+// ⚠ Guarded with an explicit tst.w/beq skip around the whole for loop --
+// see Quirk 6 in the compiler-quirks reference near the top of this file.
+// Without the guard, an empty list (rdn=0, the normal case on a buffer's
+// first-ever use) still ran the loop body ONCE with garbage data (nothing
+// was ever written to slot 0), then looped for up to 65536 iterations
+// before a 16-bit wraparound accidentally let it exit -- each iteration a
+// real blitter operation at a garbage address. Symptom, confirmed by
+// direct assembly inspection after the fact rather than guessed: clean
+// background for a few seconds (however long ~65536 blitter round-trips
+// takes), then rapidly escalating full-screen corruption, with the
+// tracked bobs never visibly drawn at all -- VBlank never got past this,
+// its very first statement, on its very first call.
+procedure RestoreDirty(rdbuf : integer);
+var rdslot, rdi, rdn : integer;
+begin
+	rdn := dirty_count[rdbuf];
+	asm("
+		tst.w Bobs_rdn
+		beq RestoreDirtyEmpty
+	");
+	for rdi:=0 to rdn do begin
+		rdslot := rdbuf*DIRTY_MAX + rdi;
+		RestoreFromPristine(dirty_blk[rdslot], dirty_y[rdslot], dirty_ww[rdslot], dirty_wh[rdslot], dirty_np[rdslot]);
+	end;
+	asm("
+	RestoreDirtyEmpty:
+	");
+	dirty_count[rdbuf] := 0;
+end;
+
+// ============================================================================
+// Tier 2 -- screen/DMA infrastructure closely tied to the bob mechanism
+// (moved from main.ras). #screen/#screen2 (and, for CopyImageToScreen
+// below, the caller's own source image) are passed in as parameters rather
+// than reached for by plain name, since this unit can't reach a plain-
+// named global declared elsewhere (rule 1 at the top of this file).
+//
+// FlipBuffer itself has TWO homes, deliberately: a fully self-contained
+// version lives HERE (own cur_buf, see its declaration comment, takes
+// #screen/#screen2 as parameters -- see tutorial.ras for the intended
+// "just call Bobs::FlipBuffer(#screen, #screen2) every frame" usage), but
+// main.ras (the larger project this unit was extracted from) keeps its
+// OWN separate FlipBuffer with its OWN cur_buf, since that one also has to
+// index player/attack position history that has nothing to do with
+// drawing a bob and would drag unrelated game-state bookkeeping in here if
+// unified. Both versions ultimately just call FlipToBuffer below and write
+// draw_target -- picking a caller's own FlipBuffer vs. this unit's is a
+// judgment call based on how much OTHER per-buffer state that caller has
+// to keep in sync at the same time.
+// ============================================================================
+
+// One-time whole-screen copy of a tightly-packed, NUM_PLANES-wide source
+// image (e.g. one exported via TRSE's own image tools, matching this
+// project's color budget but carrying no DISPLAY_BITPLANES padding) into a
+// screen-shaped (ROW_STRIDE-wide) destination -- see tutorial.ras's own
+// `image` declaration comment for why the source and destination need
+// DIFFERENT moduli here (cipsmod for the tightly-packed source, cipdmod
+// for the padded destination), unlike CopyScreenToScreen2 below, where
+// both sides share the same layout and modulo.
+//
+// Per-plane loop, same reasoning as CaptureBgPristine/CopyScreenToScreen2:
+// a single whole-buffer BLTSIZE call would need a width of ROW_STRIDE/2
+// words, which overflows BLTSIZE's 6-bit width field once ROW_STRIDE
+// exceeds 126 bytes -- safe today but not worth relying on, and this is a
+// one-time startup cost regardless.
+procedure CopyImageToScreen(cisrc, cidst : pointer of byte);
+var cippl, cipsmod, cipdmod, cipsize : integer; cipsrcp, cipdstp : pointer of byte;
+begin
+	cipsmod := 40*(NUM_PLANES-1);
+	cipdmod := ROW_STRIDE - 40;
+	cipsize := (256<<6) | 20;   // 20 words = 40 bytes = one plane's row width
+	for cippl:=0 to NUM_PLANES do begin
+		cipsrcp := cisrc + 40*cippl;
+		cipdstp := cidst + 40*cippl;
+		asm("
+			lea $dff000,a6
+			move.l Bobs_cipsrcp,a0
+			move.l Bobs_cipdstp,a1
+		CopyImageToScreenWait:
+			btst #14,$dff002
+			bne.s CopyImageToScreenWait
+			move.l #$ffffffff,BLTAFWM(a6)
+			move.w #$09f0,BLTCON0(a6)
+			move.w #$0,BLTCON1(a6)
+			move.w Bobs_cipsmod,BLTAMOD(a6)
+			move.w Bobs_cipdmod,BLTDMOD(a6)
+			move.l a0,BLTAPTH(a6)
+			move.l a1,BLTDPTH(a6)
+			move.w Bobs_cipsize,BLTSIZE(a6)
+		");
+	end;
+end;
+
+// One-time whole-screen capture into bg_pristine -- see bg_pristine's own
+// declaration comment above. cscreen is passed in as a parameter (#screen
+// in main.ras) rather than referenced by plain name, since #screen is
+// declared in main.ras and this unit can't reach it otherwise (rule 1).
+// "cscreen + 40*cppl" is a pointer-PARAMETER base plus ONE inline
+// multiplication -- the same 2-term shape already proven safe by
+// BlitStampMaskedPerPlane's "ppwmask + ppl*ppchunk" above. Quirk 3 in the
+// compiler-quirks reference near the top of this file (the truncating-add
+// bug) is specific to a pointer VARIABLE base in a 3-term expression --
+// it does not apply to a parameter, nor to this simpler 2-term shape.
+procedure CaptureBgPristine(cscreen : pointer of byte);
+var cppl, cpmod, cpsize : integer; cpsrc, cpdst : pointer of byte;
+begin
+	cpmod := ROW_STRIDE - 40;
+	cpsize := (256<<6) | 20;   // 20 words = 40 bytes = one plane's row width
+	for cppl:=0 to DISPLAY_BITPLANES do begin
+		cpsrc := cscreen + 40*cppl;
+		cpdst := #bg_pristine + 40*cppl;
+		asm("
+			lea $dff000,a6
+			move.l Bobs_cpsrc,a0
+			move.l Bobs_cpdst,a1
+		CaptureBgPristineWait:
+			btst #14,$dff002
+			bne.s CaptureBgPristineWait
+			move.l #$ffffffff,BLTAFWM(a6)
+			move.w #$09f0,BLTCON0(a6)
+			move.w #$0,BLTCON1(a6)
+			move.w Bobs_cpmod,BLTAMOD(a6)
+			move.w Bobs_cpmod,BLTDMOD(a6)
+			move.l a0,BLTAPTH(a6)
+			move.l a1,BLTDPTH(a6)
+			move.w Bobs_cpsize,BLTSIZE(a6)
+		");
+	end;
+end;
+
+// One-time startup copy of a caller's front buffer into its back buffer,
+// so both buffers start out identical before any entity is ever drawn on
+// either -- otherwise the back buffer's very first frame on screen (after
+// the first flip) would show whatever uninitialized chip RAM it started
+// with everywhere an entity hasn't yet drawn/restored over. Both source
+// and destination are parameters for the same reason as CaptureBgPristine
+// above (this unit can't reach a caller's plain-named buffer any other
+// way -- rule 1 at the top of this file).
+procedure CopyScreenToScreen2(cs2screen, cs2screen2 : pointer of byte);
+var cs2pl, cs2mod, cs2size : integer; cs2src, cs2dst : pointer of byte;
+begin
+	cs2mod := ROW_STRIDE - 40;
+	cs2size := (256<<6) | 20;
+	for cs2pl:=0 to DISPLAY_BITPLANES do begin
+		cs2src := cs2screen + 40*cs2pl;
+		cs2dst := cs2screen2 + 40*cs2pl;
+		asm("
+			lea $dff000,a6
+			move.l Bobs_cs2src,a0
+			move.l Bobs_cs2dst,a1
+		CopyScreenToScreen2Wait:
+			btst #14,$dff002
+			bne.s CopyScreenToScreen2Wait
+			move.l #$ffffffff,BLTAFWM(a6)
+			move.w #$09f0,BLTCON0(a6)
+			move.w #$0,BLTCON1(a6)
+			move.w Bobs_cs2mod,BLTAMOD(a6)
+			move.w Bobs_cs2mod,BLTDMOD(a6)
+			move.l a0,BLTAPTH(a6)
+			move.l a1,BLTDPTH(a6)
+			move.w Bobs_cs2size,BLTSIZE(a6)
+		");
+	end;
+end;
+
+// Pokes just the 3 bitplane-pointer copper slots (copper_bitplane0/1/2)
+// directly, instead of calling Graphics::SetupDefaultScreen every frame to
+// achieve the same pointer update. That built-in procedure also re-pokes
+// copper_resolution and copper_mod_even/odd, and walks a bpl=5/4/3/2/1
+// comparison chain, every single call -- none of which ever changes frame
+// to frame once the display mode is set up; only the bitplane pointer
+// itself differs between calls. This hand-rolls just the pointer pokes
+// instead, using the exact two-word-pair write pattern
+// (SetCopperList32-shaped) the compiler itself generates for a copper
+// list entry -- confirmed by reading the compiled output. Hardcodes
+// exactly 3 planes, matching NUM_PLANES=DISPLAY_BITPLANES=3 -- if
+// DISPLAY_BITPLANES is ever raised for real, this needs a 4th/5th poke
+// added, or the caller needs to fall back to calling
+// Graphics::SetupDefaultScreen again instead of this; it will NOT
+// silently do the right thing on its own. copper_bitplane0/1/2 are
+// compiler-generated labels
+// (part of the static copper list template), not user-declared Pascal
+// vars -- referenced directly here with no "Bobs_" qualification.
+// CONFIRMED (not just assumed) via direct main.asm inspection after this
+// unit's first successful build: compiler-generated labels are NOT
+// subject to the per-unit mangling rule 1 at the top of this file
+// describes for user-declared identifiers -- "lea copper_bitplane0,a0"
+// and "lea copper_custom,a5" both appear verbatim, unprefixed, inside
+// this unit's own compiled code. Whether that's because they're emitted
+// into a single shared namespace regardless of file, or some other
+// mechanism, wasn't determined -- only that it works.
+//
+// WRITE-ORDER BUG, found and fixed under real timing pressure (a tutorial
+// build with enough bobs to approach the NTSC frame budget): each
+// copper_bitplaneN label is TWO separate copper MOVE instructions back to
+// back with no WAIT between them -- confirmed via the compiled copper
+// list itself:
+//     copper_bitplane0:  dc.w $e0,0    (BPL1PTH -- register+data, offset 0/2)
+//                        dc.w $e2,0    (BPL1PTL -- register+data, offset 4/6)
+// The copper executes these in address order -- PTH's data word (offset 2)
+// BEFORE PTL's data word (offset 6). The ORIGINAL version of this
+// procedure wrote them in the OPPOSITE order (offset 6 first, then offset
+// 2, with a "swap" instruction sitting between the two writes) -- a
+// mismatch that is exactly the shape of a torn-pointer race: if the
+// copper's own read of these two words happens to fall between the CPU's
+// two writes, it loads the OLD PTH combined with the NEW PTL (or vice
+// versa on some other interleaving), producing a corrupted, half-updated
+// bitplane address. Agnus then fetches that plane's data from that wrong
+// address for the rest of the frame -- which showed up on screen as
+// recognizable sprite/mask content (still real chip RAM, often still part
+// of the intended buffer) landing at the wrong row, spread across the
+// display width as multiple bobs each contributed a fragment.
+//
+// This only manifests when FlipBuffer's poke happens LATE in the frame --
+// i.e. when the whole per-frame pipeline is close to (or over) the frame
+// budget, leaving little margin before the copper next reaches these
+// instructions. Confirmed via direct A/B testing: clean under PAL (more
+// headroom) and at lower enemy counts, corrupted under NTSC with enough
+// bobs active to push the frame close to full. This is the general class
+// of hazard any live copper-list poke runs: an unthrottled write racing
+// the copper's own read of the same data, made worse here because nothing
+// constrains WHEN within the frame an otherwise-correct interrupt-driven
+// pipeline reaches its own flip -- the closer to the frame's end it runs,
+// the less margin is left before the copper's own next read of these
+// exact words.
+//
+// FIX: write PTH's data word (offset 2) BEFORE PTL's data word (offset 6)
+// -- matching the copper's own read order -- with NO instruction between
+// the two writes (both halves of the address are computed into separate
+// registers, d0/d1, before either write happens). This doesn't
+// mathematically prove the race is impossible under every conceivable
+// timing, but it eliminates the specific inverted-order mismatch that
+// made it easy to trigger, and matches the standard technique for this
+// kind of live copper-list poke.
+procedure FlipToBuffer(fbbuf : pointer of byte);
+begin
+	asm("
+		move.l Bobs_fbbuf,d0
+		move.l d0,d1
+		swap d1
+		lea copper_bitplane0,a0
+		move.w d1,2(a0)
+		move.w d0,6(a0)
+		move.l Bobs_fbbuf,d0
+		add.l #40,d0
+		move.l d0,d1
+		swap d1
+		lea copper_bitplane1,a0
+		move.w d1,2(a0)
+		move.w d0,6(a0)
+		move.l Bobs_fbbuf,d0
+		add.l #80,d0
+		move.l d0,d1
+		swap d1
+		lea copper_bitplane2,a0
+		move.w d1,2(a0)
+		move.w d0,6(a0)
+	");
+end;
+
+// Self-contained double-buffering flip: makes cur_buf's buffer (the one
+// this frame just finished drawing into) the new FRONT/displayed buffer,
+// then flips cur_buf/draw_target so the NEXT frame draws into the buffer
+// that is now safely off-screen again. Callers with no other per-buffer
+// state to manage (see this section's own header comment) can use this
+// directly -- Bobs::FlipBuffer(#screen, #screen2) -- with no bookkeeping
+// of their own beyond that single call.
+//
+// The BBUSY wait first is deliberate, not decorative: a masked/shifted
+// draw call triggers its last blit and returns immediately, so the last
+// blit into this buffer may still be running -- waiting here guarantees
+// the buffer is fully, consistently drawn before it can become visible.
+//
+// The flip itself pokes the copper's own bitplane-pointer words directly
+// (FlipToBuffer above) -- a handful of register pokes, not a data-moving
+// operation, so doing this every frame costs nothing like a screen-sized
+// blit would. The copper re-executes those pointer words once per real
+// vertical blank, and this poke's effect is normally only visible
+// starting the NEXT vblank -- by which point the blit this procedure just
+// waited for has long since finished, so there's nothing left for the
+// beam to tear.
+//
+// CALL THIS LAST IN YOUR INTERRUPT HANDLER, after Restore/Update/Draw --
+// NOT first, despite that being the obvious-looking fix for the write-
+// order race documented in FlipToBuffer's own comment (whose margin
+// shrinks as a frame's workload grows). That was tried directly and
+// reverted after live testing in emulation: calling FlipBuffer as the
+// very FIRST thing in the handler made the "only visible starting the
+// NEXT vblank" assumption above stop holding -- the newly-flipped-to back
+// buffer became visible in the SAME frame draws started landing on it,
+// i.e. the poke won the race against the copper's read for the frame
+// that was already starting, not the following one. Exact hardware
+// mechanism not root-caused (this project's working theory: VERTB and
+// the copper's own list restart are close enough in timing that a poke
+// issued with minimal interrupt-entry latency can beat the copper to
+// these words, where one issued after a frame's worth of blitter-bound
+// work reliably can't) -- but the empirical, tested conclusion is firm:
+// keep this call LAST. If the write-order race's margin is too tight at
+// your workload, look to speeding up what runs before this call (see
+// BlitterNastyOn's own comment for one attempt) rather than moving this
+// call earlier.
+procedure FlipBuffer(fbscreen, fbscreen2 : pointer of byte);
+begin
+	asm("
+		FlipBufferSelfWait:
+		btst #14,$dff002
+		bne.s FlipBufferSelfWait
+	");
+	if (cur_buf=0) then begin
+		FlipToBuffer(fbscreen);
+		cur_buf := 1;
+		draw_target := fbscreen2;
+	end else begin
+		FlipToBuffer(fbscreen2);
+		cur_buf := 0;
+		draw_target := fbscreen;
+	end;
+end;
+
+// ============================================================================
+// "Blitter Nasty" -- BLTPRI, DMACON bit 10 ($0400): while a blit is
+// running, setting this bit makes the blitter win every bus cycle it
+// contests against the CPU, instead of sharing turn-and-turn-about. It
+// changes NOTHING about the copper, bitplane fetch, sprites, audio, or
+// disk DMA -- all of those already outrank the blitter in the Amiga's
+// fixed DMA priority chain regardless of this bit, so the display and the
+// copper program can never be disrupted by it. The CPU is the only
+// affected party, and only for the duration of an actual blit -- BLTPRI is
+// completely inert whenever the blitter is idle.
+//
+// COMMON MISTAKE, worth flagging explicitly: BLTCON1 bit 1 is NOT a
+// priority bit -- that bit is DESC (descending-mode addressing, which
+// runs the blitter backwards through its pointers). Setting DESC while
+// the pointers are still configured for a normal ascending blit produces
+// garbage output that looks nothing like a priority/timing problem.
+// BLTPRI lives only in DMACON, at bit 10 ($0400) -- a completely different
+// register. DMACON uses the standard Amiga SET/CLR convention: writing a
+// value with bit 15 set OR's the given bits in (SET), writing one with
+// bit 15 clear AND-clears them (CLR) -- so "move.w #$8400,$dff096" sets
+// BLTPRI and "move.w #$0400,$dff096" clears it; both are bit-masked writes
+// that cannot disturb DMAEN/BPLEN/COPEN/BLTEN or any other DMACON bit.
+//
+// WHY THIS IS SAFE TO USE HEAVILY: every blit issued by this unit is
+// finite and short, and the CPU has nothing else productive to do while
+// waiting for one -- it's spinning in a BBUSY busy-wait (a tight
+// "btst #14,$dff002 / bne.s" loop) for the blit to finish anyway. Handing
+// the blitter absolute priority during that wait costs the CPU nothing it
+// was going to use productively, and shortens how long the blit itself
+// takes to complete under contention. There is no starvation or deadlock
+// scenario to construct here, since nothing ever waits on the CPU to make
+// progress while BLTPRI is set -- worst case the CPU runs slightly slower
+// for the duration of one blit.
+//
+// TWO WAYS TO SCOPE IT: BlitterNastyOn/Off below bracket it around a block
+// of code (CPU-scoped) -- simple, and correct as long as the CPU has
+// genuinely idle time during that block. InstallNastyCopper further down
+// instead has the COPPER clear BLTPRI at a fixed early raster line and set
+// it again at a later one (nasty_on_line) -- raster-scoped, enforced by
+// hardware rather than by code reaching a particular line, so a blit that
+// overruns into the visible display window can't leave BLTPRI stuck on by
+// accident. Raster-scoping is the one to prefer once other CPU work (input
+// polling, game logic) starts overlapping the blits, since it guarantees
+// the CPU gets its normal share back for the visible portion of the frame
+// regardless of how the surrounding code is structured.
+//
+// MEASURED RESULT (this project's own finding, worth passing on): enabling
+// BLTPRI barely changed raw blit throughput -- if the CPU isn't executing
+// from a bus-contending memory region, its BBUSY-poll loop may not be
+// stealing enough cycles from the blitter for this to matter much either
+// way. What it DID fix was tearing/non-determinism: without it, a blit
+// could be caught mid-operation by the raster beam or by another
+// contending access, producing a partially-written sprite for one frame.
+// With BLTPRI on, each blit completes as one uninterrupted, deterministic
+// burst. So treat this primarily as a correctness/determinism tool for
+// blits that share the bus with other contending activity, not as a
+// guaranteed throughput win -- measure on your own target before relying
+// on a speed improvement.
+//
+// SECOND MEASUREMENT, a different project and a different question
+// (tutorial.ras, testing whether BLTPRI could widen the margin on the
+// copper write-order race documented in FlipToBuffer's own comment, by
+// speeding up the blitter-bound work that runs before FlipBuffer's own
+// poke): enabling it by default made things WORSE, not better, at the
+// workload's edge (9 bobs, right where that race's margin was already
+// thin) -- visibly MORE unstable artifacts with BLTPRI on than off,
+// tested live in emulation. At a comfortable bob count (8, below the
+// edge) it measured no different either way, consistent with the first
+// finding above. Root mechanism not established -- worth flagging one
+// plausible direction rather than leaving it a pure mystery: BLTPRI only
+// changes who wins CONTESTED cycles, it doesn't create bus bandwidth, so
+// if the CPU's own BBUSY-poll loop was providing some incidental, non-
+// obvious timing regularity that happened to keep FlipBuffer's poke
+// falling in a safe part of the frame, removing that regularity (by
+// letting the blitter run less interrupted, shifting exactly when each
+// blit's BBUSY wait resolves) could plausibly move the poke's timing
+// AROUND rather than simply earlier -- occasionally into the danger
+// window rather than reliably out of it. Speculative, not confirmed.
+// Net conclusion for this project: BLTPRI is not a reliable fix for the
+// write-order race specifically, and given it measured somewhere between
+// no-help and actively-worse for that exact use, tutorial.ras leaves it
+// out entirely rather than enabling it as a mitigation.
+// ============================================================================
+
+// Give the blitter absolute bus priority. Written as a raw immediate
+// rather than through a TRSE variable deliberately -- $8400 has its high
+// bit set (reads as negative in 16-bit signed terms), exactly the shape
+// Quirk 5 in the compiler-quirks reference near the top of this file
+// miscompiles when it goes through constant-assignment codegen inside a
+// branch.
+//
+// TO ENABLE THIS BY DEFAULT FOR A WHOLE PROGRAM RUN: call
+// Bobs::BlitterNastyOn() ONCE from the caller's own Main() setup, before
+// enabling interrupts, and simply never call BlitterNastyOff -- there is
+// no per-frame maintenance needed (DMACON just holds whatever it was last
+// set to). Can't be wired to happen automatically from inside FlipBuffer
+// itself despite that being the more "zero caller changes needed" option
+// -- FlipBuffer is declared earlier in this file than this procedure, and
+// Quirk 7 in the compiler-quirks reference confirms a same-unit call to a
+// later-declared procedure fails to compile at all.
+procedure BlitterNastyOn();
+begin
+	asm("
+		move.w #$8400,$dff096
+	");
+end;
+
+// Hand the CPU its normal share of the bus back. The BBUSY spin first is
+// deliberate: a caller's own draw call typically triggers its last blit
+// and returns immediately without waiting for it to finish, so clearing
+// BLTPRI right away -- before that blit has actually completed -- would
+// drop blitter priority for the tail end of an operation that's still
+// running, right when contention is most likely to slow it down.
+procedure BlitterNastyOff();
+begin
+	asm("
+		NastyOffWait:
+		btst #14,$dff002
+		bne.s NastyOffWait
+		move.w #$0400,$dff096
+	");
+end;
+
+// Mode 1: hand the whole BLTPRI window over to the copper, so it toggles
+// automatically at fixed raster positions every frame with ZERO per-frame
+// CPU maintenance -- unlike, say, a bitplane pointer register that
+// auto-increments and needs re-poking every frame, DMACON just sits at
+// whatever it was last set to, so writing this once at startup is enough
+// forever.
+//
+// copper_custom is a compiler-generated label -- the static copper list's
+// spare/reusable template block -- referenced directly with no "Bobs_"
+// qualification, same reasoning as FlipToBuffer's copper_bitplaneN
+// references above (compiler-generated labels live in one shared
+// namespace, not subject to this unit's own identifier-mangling rules).
+// It is positioned in the compiler's static copper list immediately after
+// a "WAIT for raster line 44" / "set BPLCON0" instruction pair that's
+// already part of every screen setup this project uses -- so by the time
+// the copper reaches copper_custom, it has just reached line 44 of the
+// CURRENT frame.
+//
+// A copper program is just a flat sequence of two-word instructions, each
+// either a WAIT or a MOVE, distinguished by bit 0 of the first word (1 =
+// WAIT, 0 = MOVE). This procedure writes 5 such instructions (10 words =
+// 20 bytes, deliberately fitting inside the 16-byte spare block this
+// project's copper_custom template reserves without overflowing into
+// whatever follows it in the compiled list):
+//   1. MOVE $0400 into register offset $096 (DMACON) -- CLEARS BLTPRI
+//      (bit 15 of the data word is 0, so this is the "AND-clear" form of
+//      DMACON's SET/CLR convention). Runs immediately, at line 44 --
+//      handing the CPU normal bus priority for the rest of the visible
+//      display.
+//   2. A WAIT instruction for raster line nasty_on_line: encoded as
+//      (nasty_on_line<<8)|1 for its first word (VP in the high byte, with
+//      bit 0 set to mark it as a WAIT rather than a MOVE) and $fffe for
+//      its second (the compare mask -- ignore horizontal position,
+//      compare vertical position only). The copper simply idles at this
+//      instruction until the raster beam reaches that line.
+//   3. MOVE $8400 into register $096 (DMACON) again -- SETS BLTPRI this
+//      time (bit 15 of the data word is 1, the "OR-set" form) -- handing
+//      the blitter absolute priority from nasty_on_line through to the
+//      bottom of the frame and the following vertical blank, which is
+//      where all of this project's per-frame blitting happens.
+//   4. A final terminator word pair ($fffffffe as a longword, i.e.
+//      $ffff,$fffe) -- a WAIT for a raster/horizontal position that a
+//      normal frame's beam never reaches, standard practice for safely
+//      ending a short inline copper block so it just idles rather than
+//      falling through into whatever instruction happens to follow it in
+//      memory.
+// Register $096 is comfortably above the copper's own "danger threshold"
+// (by default the copper refuses to write registers below $080 unless
+// explicitly permitted), so no CDANG/COPCON change is needed for any of
+// this to work.
+procedure InstallNastyCopper();
+begin
+	asm("
+		lea copper_custom,a5
+		move.w #$0096,(a5)+
+		move.w #$0400,(a5)+
+		move.w Bobs_nasty_on_line,d0
+		lsl.w #8,d0
+		or.w #$0001,d0
+		move.w d0,(a5)+
+		move.w #$fffe,(a5)+
+		move.w #$0096,(a5)+
+		move.w #$8400,(a5)+
+		move.l #$fffffffe,(a5)+
+	");
+end;
+
+// ============================================================================
+// GENERAL-PURPOSE HELPERS -- flagged as POTENTIALLY BELONGING IN ANOTHER
+// LIBRARY, not this one.
+//
+// IdleUntilInterrupt and ProfMark below have nothing to do with drawing or
+// erasing blitter objects -- they're generic 68000/Amiga utilities (a CPU
+// idle-halt, and a one-instruction raster-timing profiler) that simply
+// happened to live in the same source file as the bob mechanism before
+// this unit was extracted from it, and were carried over here along with
+// everything else rather than left behind or given a third home of their
+// own. Noting this explicitly for whoever ends up organizing this as a
+// shared, multi-unit TRSE library: these two arguably belong in a more
+// general-purpose unit (something like a "system.tru" or "debug.tru", if
+// one exists or gets created) rather than in a unit whose name and header
+// comment are specifically about blitter objects. They're kept here for
+// now, in their own clearly separate section, since this project currently
+// only has the one shared unit -- move them freely whenever a better home
+// exists; nothing else in this unit depends on them.
+// ============================================================================
+
+// Genuine CPU-halt for an otherwise-empty main loop: the 68000 STOP
+// instruction loads the given 16-bit value into SR, then stops
+// fetching/executing entirely until ANY interrupt whose priority exceeds
+// the resulting IPL mask occurs, at which point it resumes at the
+// instruction right after STOP -- unlike an empty while-loop, the CPU is
+// not executing NOP-equivalent iterations while idle, it is doing nothing
+// at all, which frees real bus bandwidth/power for the rest of the
+// system while there's genuinely nothing for the CPU to do.
+//
+// $2000 = supervisor bit (13) set, IPL mask (bits 8-10) at 0, trace (15)
+// off, condition codes cleared. IPL=0 ("wake on anything") sidesteps
+// needing to know any particular interrupt source's exact hardware
+// priority level -- if interrupts are already firing and being serviced
+// correctly elsewhere in the calling program, the CPU's own interrupt
+// mask is necessarily already low enough for that to happen, and 0 is
+// the lowest it can be, so this can only be at least as permissive as
+// whatever's already working.
+//
+// STOP is PRIVILEGED -- requires supervisor mode. If a program using this
+// crashes or guru-meditates the instant it's reached, that's the first
+// thing to suspect: the program may be running in user mode, in which
+// case STOP needs a supervisor-mode transition first, rather than being
+// usable directly here.
+procedure IdleUntilInterrupt();
+begin
+	asm("
+		stop #$2000
+	");
+end;
+
+// Writes a 12-bit Amiga color ($0RGB) directly to COLOR00 ($dff180), the
+// border/background hardware color register -- one instruction, no loops,
+// no arrays, no screen-memory pointer arithmetic, so there's nothing for a
+// pointer-arithmetic bug to grab onto even under heavy debugging use. The
+// color takes effect the instant the CPU executes it and holds until the
+// next write (the caller's own next call, or the copper's own per-frame
+// palette application at the top of the next frame) -- so calling this
+// with a distinct color at each phase boundary in a main loop or interrupt
+// handler turns the border into a live bar chart: each phase's color
+// occupies the border for exactly as many raster lines as that phase took
+// to run, visible directly as colored band height. No copper list changes
+// needed -- the copper isn't involved in the timing at all, it's just
+// continuously displaying whatever COLOR00 currently holds as the beam
+// scans past.
+procedure ProfMark(pmcolor : integer);
+begin
+	asm("
+		move.w Bobs_pmcolor,$dff180
+	");
+end;
+
+end.
