@@ -14,7 +14,7 @@ This is necessary for Amiga game development - particularly for arcade style gam
 These examples are designed to run flawlessly on both PAL and NTSC. PAL has a slightly bigger frame time budget, so we are targeting 60 frames per second on NTSC. This makes it work with full framerates on both targets without changes.
 
 
-It is using the Amiga blitter to display 32x64 pixel bobs.
+It started using the Amiga blitter to display 32x64 pixel bobs which is a good size for 16-bit beat-em-ups.
 
 
 Initially it was built for individual bitplane placement. This required one individual blit per bitplane to move the object, and gave me only 2 objects that could flawlessly display in NTSC mode.
@@ -31,7 +31,10 @@ This, combined with turning on the so called "blitter nasty" flag gave us 7 movi
 
 
 
-But at this stage tearing was becoming a problem, and to solve this double buffering was implemented. This gave us 8 moving objects flicker free, and I think that is probably the limit of the blitter's capabilities at 60 frames per second at this size.
+But at this stage tearing was becoming a problem, and to solve this double buffering was implemented. This gave us 8 moving objects flicker free.
+
+Update 2026.09.03:
+Automated and optimized the way double buffering works, thus giving us nine 32x64 pixel bobs moving on screen. This is probably the limit of the blitter's capabilities at 60 frames per second at this size.
 
 Changing object size can of course give even more or less objects. Blitter bandwidth is the key constraint.
 
